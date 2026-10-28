@@ -1,0 +1,3169 @@
+#!/usr/bin/env python3
+"""
+Open Design Desktop Companion for Linux.
+Manages background services, PWA window execution, and GTK4 updates.
+"""
+import fcntl
+import glob
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+
+DEFAULT_REPO = os.path.expanduser("~/open-design")
+DEFAULT_PORT = "3000"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PWA_DIR = os.path.expanduser("~/.config/open-design-pwa")
+DEFAULT_REPO_URL = "https://github.com/nexu-io/open-design/releases"
+
+# Supported Chromium-based browsers capable of isolated --app window mode.
+BROWSER_ALIASES = {
+    "google-chrome": [
+        "google-chrome-stable",
+        "google-chrome",
+    ],
+    "chromium": [
+        "chromium-browser",
+        "chromium",
+    ],
+    "brave": [
+        "brave-browser",
+        "brave",
+    ],
+    "brave-origin": [
+        "/opt/brave.com/brave-origin/brave",
+        "brave-origin-stable",
+        "brave-origin",
+    ],
+    "microsoft-edge": [
+        "microsoft-edge-stable",
+        "microsoft-edge",
+    ],
+}
+
+_INTERPRETER_NAMES = frozenset({"sh", "bash", "dash", "zsh", "env", "python", "python3"})
+
+
+def _expand_path(val):
+    """Expand ~ without interpreting literal dollar signs in directory names."""
+    return os.path.abspath(os.path.expanduser(val.strip()))
+
+
+def _valid_port(val):
+    """Validate a port value; return the string port or None if invalid."""
+    try:
+        p = int(str(val).strip())
+        if 1 <= p <= 65535:
+            return str(p)
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _valid_host(val):
+    """Validate a host value; return '127.0.0.1' or 'localhost' (matching upstream sidecar binding)."""
+    if not val:
+        return None
+    h = str(val).strip()
+    if h in ("127.0.0.1", "localhost"):
+        return h
+    return None
+
+
+def load_config():
+    """Load configuration from ~/.config/open-design/config with environment overrides.
+
+    Precedence (highest wins): environment variables > config file > defaults.
+    """
+    cfg = {
+        "repo": DEFAULT_REPO,
+        "port": DEFAULT_PORT,
+        "host": DEFAULT_HOST,
+        "pwa_dir": DEFAULT_PWA_DIR,
+        "browser": "auto",
+    }
+
+    config_path = os.path.expanduser("~/.config/open-design/config")
+    if os.path.exists(config_path):
+        try:
+            file_cfg = {}
+            with open(config_path, "r", encoding="utf-8", errors="strict") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    if not val:
+                        continue
+                    if key == "OPEN_DESIGN_REPO":
+                        file_cfg["repo"] = _expand_path(val)
+                    elif key == "OPEN_DESIGN_PORT":
+                        valid_p = _valid_port(val)
+                        if valid_p:
+                            file_cfg["port"] = valid_p
+                    elif key == "OPEN_DESIGN_HOST":
+                        valid_h = _valid_host(val)
+                        if valid_h:
+                            file_cfg["host"] = valid_h
+                    elif key == "OPEN_DESIGN_PWA_DIR":
+                        file_cfg["pwa_dir"] = _expand_path(val)
+                    elif key == "OPEN_DESIGN_BROWSER":
+                        file_cfg["browser"] = val
+            cfg.update(file_cfg)
+        except (OSError, UnicodeDecodeError):
+            print("Warning: Ignoring unreadable or malformed ~/.config/open-design/config; using defaults.", file=sys.stderr)
+
+    # Environment variables take highest precedence
+    if os.environ.get("OPEN_DESIGN_REPO"):
+        cfg["repo"] = _expand_path(os.environ["OPEN_DESIGN_REPO"])
+    if os.environ.get("OPEN_DESIGN_PORT"):
+        valid_p = _valid_port(os.environ["OPEN_DESIGN_PORT"])
+        if valid_p:
+            cfg["port"] = valid_p
+    if os.environ.get("OPEN_DESIGN_HOST"):
+        valid_h = _valid_host(os.environ["OPEN_DESIGN_HOST"])
+        if valid_h:
+            cfg["host"] = valid_h
+    if os.environ.get("OPEN_DESIGN_PWA_DIR"):
+        cfg["pwa_dir"] = _expand_path(os.environ["OPEN_DESIGN_PWA_DIR"])
+    if os.environ.get("OPEN_DESIGN_BROWSER"):
+        cfg["browser"] = os.environ["OPEN_DESIGN_BROWSER"].strip()
+
+    def _paths_overlap(p1, p2):
+        r1, r2 = os.path.realpath(p1), os.path.realpath(p2)
+        return r1 == r2 or r1.startswith(r2 + os.sep) or r2.startswith(r1 + os.sep)
+
+    config_dir = os.path.expanduser("~/.config/open-design")
+    share_dir = os.path.expanduser("~/.local/share/open-design")
+    unsafe_dirs = {
+        "",
+        "/",
+        os.path.expanduser("~"),
+        os.path.expanduser("~/.config"),
+        os.path.expanduser("~/.local"),
+        os.path.expanduser("~/.local/share"),
+        config_dir,
+        share_dir,
+    }
+    real_unsafe = {os.path.realpath(d) for d in unsafe_dirs if d}
+    if (
+        cfg["repo"] in unsafe_dirs
+        or os.path.realpath(cfg["repo"]) in real_unsafe
+        or _paths_overlap(cfg["repo"], config_dir)
+        or _paths_overlap(cfg["repo"], DEFAULT_PWA_DIR)
+        or _paths_overlap(cfg["repo"], share_dir)
+        or any(ord(c) < 32 or ord(c) == 127 for c in cfg["repo"])
+    ):
+        cfg["repo"] = DEFAULT_REPO
+    if (
+        cfg["pwa_dir"] in unsafe_dirs
+        or os.path.realpath(cfg["pwa_dir"]) in real_unsafe
+        or _paths_overlap(cfg["pwa_dir"], cfg["repo"])
+        or _paths_overlap(cfg["pwa_dir"], DEFAULT_REPO)
+        or _paths_overlap(cfg["pwa_dir"], config_dir)
+        or _paths_overlap(cfg["pwa_dir"], share_dir)
+        or any(ord(c) < 32 or ord(c) == 127 for c in cfg["pwa_dir"])
+    ):
+        cfg["pwa_dir"] = DEFAULT_PWA_DIR
+
+    return cfg
+
+
+def _has_node24_runtime():
+    node_bin = shutil.which("node")
+    if not node_bin:
+        return False, "not found"
+    try:
+        res = subprocess.run([node_bin, "--version"], capture_output=True, text=True, timeout=3)
+        ver = res.stdout.strip()
+        m = re.match(r"^v?(\d+)\.", ver)
+        if m and int(m.group(1)) == 24:
+            return True, ver
+        return False, ver or "unknown"
+    except Exception:
+        return False, "unknown"
+
+
+def _has_pnpm_node24():
+    """Verify pnpm is available and executes under a Node.js 24 runtime."""
+    pnpm_bin = shutil.which("pnpm")
+    if not pnpm_bin:
+        return False, "not found"
+    real_pnpm = os.path.realpath(pnpm_bin)
+    if os.path.isfile(real_pnpm):
+        try:
+            with open(real_pnpm, "rb") as f:
+                first = f.readline()
+            if first.startswith(b"#!"):
+                toks = first[2:].decode("utf-8", errors="ignore").strip().split()
+                if toks and os.path.basename(toks[0]) != "env" and "node" in os.path.basename(toks[0]):
+                    interp = toks[0]
+                    r = subprocess.run([interp, "--version"], capture_output=True, text=True, timeout=3)
+                    m_n = re.match(r"^v?(\d+)\.", r.stdout.strip())
+                    if not m_n or int(m_n.group(1)) != 24:
+                        return False, f"pnpm interpreter {interp} is {r.stdout.strip() or 'not Node 24'}"
+        except Exception as e:
+            return False, str(e)
+
+    probe = None
+    try:
+        fd, probe = tempfile.mkstemp(prefix="od-n24-", suffix=".cjs", dir="/tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as pf:
+            pf.write("if (parseInt(process.versions.node, 10) !== 24) { process.exit(42); }\n")
+        os.chmod(probe, 0o600)
+        env = os.environ.copy()
+        prev_opts = env.get("NODE_OPTIONS", "").strip()
+        env["NODE_OPTIONS"] = f"{prev_opts} --require {probe}".strip()
+        res = subprocess.run([pnpm_bin, "--version"], env=env, capture_output=True, text=True, timeout=5)
+        if res.returncode == 42:
+            return False, "pnpm is not running under Node.js 24"
+        if res.returncode != 0:
+            return False, "pnpm failed to execute"
+        ver_str = res.stdout.strip()
+        m = re.match(r"^(\d+)\.(\d+)\.(\d+)", ver_str)
+        v = tuple(map(int, m.groups())) if m else ()
+        if not ((10, 33, 2) <= v < (11, 0, 0)):
+            return False, f"found pnpm {ver_str or 'unknown'}, requires pnpm 10.x (>=10.33.2)"
+        return True, ver_str
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if probe:
+            try:
+                os.unlink(probe)
+            except OSError:
+                pass
+
+
+def _ensure_node24_pnpm_shims(shim_dir):
+    """Wrap symlinked or hardcoded #!/usr/bin/node shims so pnpm/corepack execute under Node 24 in PATH."""
+    def _resolve_cp_js(real_target):
+        d = os.path.dirname(real_target)
+        for cand in (os.path.join(d, "corepack.js"), os.path.join(os.path.dirname(d), "dist", "corepack.js")):
+            if os.path.isfile(cand):
+                return cand
+        return None
+
+    def _write_wrap(dest, real_target):
+        try:
+            os.makedirs(shim_dir, mode=0o700, exist_ok=True)
+            os.chmod(os.path.dirname(shim_dir), 0o700)
+            os.chmod(shim_dir, 0o700)
+            if os.path.lexists(dest):
+                os.unlink(dest)
+            cp_js = _resolve_cp_js(real_target) if os.path.basename(dest) == "pnpm" else None
+            if cp_js:
+                exec_line = f'COREPACK_ENABLE_DOWNLOAD_PROMPT=0 exec node {shlex.quote(cp_js)} pnpm@10.33.2 "$@"'
+            else:
+                exec_line = f'exec node {shlex.quote(real_target)} "$@"'
+            with open(dest, "w", encoding="utf-8") as out:
+                out.write(f"#!/usr/bin/env sh\n# open-design node24 shim\n{exec_line}\n")
+            os.chmod(dest, 0o755)
+        except OSError:
+            pass
+
+    for name in ("pnpm", "pnpx", "corepack"):
+        shim_p = os.path.join(shim_dir, name)
+        if os.path.islink(shim_p):
+            real_t = os.path.realpath(shim_p)
+            if os.path.isfile(real_t):
+                try:
+                    with open(real_t, "rb") as f:
+                        first = f.readline()
+                    if first.startswith(b"#!") and b"node" in first:
+                        _write_wrap(shim_p, real_t)
+                except OSError:
+                    pass
+            else:
+                try:
+                    os.unlink(shim_p)
+                except OSError:
+                    pass
+        elif os.path.isfile(shim_p):
+            try:
+                with open(shim_p, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = [l.strip() for l in f.read(512).splitlines()]
+                if len(lines) >= 3 and lines[1] == "# open-design node24 shim" and "exec node " in lines[2]:
+                    after_exec = lines[2].split("exec node ", 1)[1]
+                    parts = shlex.split(after_exec)
+                    if parts and not os.path.isfile(parts[0]):
+                        os.unlink(shim_p)
+                    elif name == "pnpm" and parts and "pnpm@10.33.2" not in lines[2] and _resolve_cp_js(parts[0]):
+                        _write_wrap(shim_p, parts[0])
+            except OSError:
+                pass
+
+        if not os.path.exists(shim_p):
+            found = shutil.which(name)
+            if found:
+                real_f = os.path.realpath(found)
+                if os.path.isfile(real_f):
+                    try:
+                        with open(real_f, "rb") as f:
+                            first = f.readline()
+                        if first.startswith(b"#!"):
+                            toks = first[2:].decode("utf-8", errors="ignore").strip().split()
+                            if toks and os.path.basename(toks[0]) != "env" and "node" in os.path.basename(toks[0]):
+                                can_wrap = (name == "corepack")
+                                if not can_wrap:
+                                    node_bin = shutil.which("node")
+                                    if node_bin:
+                                        cp_js = _resolve_cp_js(real_f) if name == "pnpm" else None
+                                        v_cmd = [node_bin, cp_js, "pnpm@10.33.2", "--version"] if cp_js else [node_bin, real_f, "--version"]
+                                        v_env = os.environ.copy()
+                                        v_env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0"
+                                        r_v = subprocess.run(v_cmd, env=v_env, capture_output=True, text=True, timeout=8)
+                                        m_v = re.match(r"^(\d+)\.(\d+)\.(\d+)", r_v.stdout.strip())
+                                        v_t = tuple(map(int, m_v.groups())) if m_v else ()
+                                        can_wrap = (10, 33, 2) <= v_t < (11, 0, 0)
+                                if can_wrap:
+                                    _write_wrap(shim_p, real_f)
+                    except Exception:
+                        pass
+
+
+def ensure_node_in_path():
+    """Ensure Node 24 and pnpm are in PATH, detecting common node managers without mutating global user binaries."""
+    current_path = os.environ.get("PATH", "")
+    orig_parts = [p for p in current_path.split(":") if p]
+    prepend_24 = []
+    fallback_dirs = []
+
+    def _ver_of(p):
+        parent = os.path.basename(os.path.dirname(p))
+        if parent == "installation":
+            parent = os.path.basename(os.path.dirname(os.path.dirname(p)))
+        return parse_ver(parent)
+
+    for pattern in (
+        "~/.nvm/versions/node/*/bin",
+        "~/.local/share/mise/installs/node/*/bin",
+        "~/.local/share/fnm/node-versions/*/installation/bin",
+    ):
+        bins = glob.glob(os.path.expanduser(pattern))
+        if bins:
+            bins.sort(key=_ver_of)
+            bins_24 = [p for p in bins if _ver_of(p)[0] == 24]
+            if bins_24:
+                prepend_24.append(bins_24[-1])
+            else:
+                fallback_dirs.append(bins[-1])
+
+    pnpm_home = os.environ.get("PNPM_HOME") or os.path.expanduser("~/.local/share/pnpm")
+    if os.path.isdir(pnpm_home):
+        prepend_24.append(pnpm_home)
+
+    app_node24_bin = os.path.expanduser("~/.local/share/open-design/node-v24/bin")
+    if os.path.isdir(app_node24_bin):
+        prepend_24.append(app_node24_bin)
+
+    shim_dir = os.path.expanduser("~/.local/share/open-design/bin")
+    if os.path.isdir(shim_dir):
+        prepend_24.append(shim_dir)
+
+    local_bin = os.path.expanduser("~/.local/bin")
+    if os.path.isdir(local_bin):
+        prepend_24.append(local_bin)
+
+    for p in ("~/.local/share/fnm/current/bin", "~/.local/share/mise/shims", "~/.asdf/shims", "~/.volta/bin"):
+        expanded = os.path.expanduser(p)
+        if os.path.isdir(expanded):
+            fallback_dirs.append(expanded)
+
+    ordered_pre = []
+    for d in prepend_24:
+        if d and d not in ordered_pre:
+            ordered_pre.append(d)
+    mid_parts = [p for p in orig_parts if p not in ordered_pre]
+    post_parts = [d for d in fallback_dirs if d not in ordered_pre and d not in mid_parts]
+    combined = ordered_pre + mid_parts + post_parts
+    if combined:
+        os.environ["PATH"] = ":".join(combined)
+
+    ok_24, _ = _has_node24_runtime()
+    if not ok_24 and os.path.isfile("/usr/bin/node-24") and os.access("/usr/bin/node-24", os.X_OK):
+        try:
+            os.makedirs(shim_dir, mode=0o700, exist_ok=True)
+            node_link = os.path.join(shim_dir, "node")
+            if not os.path.exists(node_link) or os.path.islink(node_link):
+                if os.path.lexists(node_link):
+                    os.unlink(node_link)
+                os.symlink("/usr/bin/node-24", node_link)
+            cur = [p for p in os.environ.get("PATH", "").split(":") if p and p != shim_dir]
+            os.environ["PATH"] = ":".join([shim_dir] + cur)
+            ok_24, _ = _has_node24_runtime()
+        except OSError:
+            pass
+
+    if ok_24:
+        _ensure_node24_pnpm_shims(shim_dir)
+        if os.path.isdir(shim_dir):
+            cur = [p for p in os.environ.get("PATH", "").split(":") if p and p != shim_dir]
+            os.environ["PATH"] = ":".join([shim_dir] + cur)
+
+
+def is_server_running(host, port):
+    """Sub-millisecond socket probe to verify if TCP port is accepting connections."""
+    valid_p = _valid_port(port)
+    if not valid_p:
+        return False
+    connect_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host.strip("[]")
+    try:
+        with socket.create_connection((connect_host, int(valid_p)), timeout=0.08):
+            return True
+    except (socket.timeout, ConnectionRefusedError, OSError, ValueError):
+        return False
+
+
+def is_http_ready(host, port):
+    """Verify the web server responds to HTTP requests before opening the app window."""
+    valid_p = _valid_port(port)
+    if not valid_p:
+        return False
+    connect_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host.strip("[]")
+    try:
+        with socket.create_connection((connect_host, int(valid_p)), timeout=0.25) as sock:
+            sock.settimeout(0.25)
+            req = f"HEAD / HTTP/1.1\r\nHost: {connect_host}:{valid_p}\r\nConnection: close\r\n\r\n"
+            sock.sendall(req.encode("ascii"))
+            data = sock.recv(16)
+            return data.startswith(b"HTTP/")
+    except (socket.timeout, ConnectionRefusedError, OSError, ValueError):
+        return False
+
+
+def _is_sandboxed_browser_bin(path):
+    """Return True if a browser executable is a Snap or Flatpak wrapper."""
+    if not path:
+        return True
+    norm = os.path.normpath(path)
+    real = os.path.realpath(path)
+    for p in (norm, real):
+        if p.startswith("/snap/") or "/snap/" in p or "flatpak" in p.lower():
+            return True
+    try:
+        with open(path, "rb") as f:
+            head = f.read(512).decode("utf-8", errors="ignore").lower()
+        if "/snap/" in head or "snap run" in head or "flatpak" in head:
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def _resolve_candidate(bin_name):
+    """Resolve a binary name or absolute path to a real native executable path."""
+    resolved = None
+    if bin_name.startswith("/"):
+        if os.path.isfile(bin_name) and os.access(bin_name, os.X_OK):
+            resolved = bin_name
+    else:
+        resolved = shutil.which(bin_name)
+    if resolved and not _is_sandboxed_browser_bin(resolved):
+        return resolved
+    return None
+
+
+def _desktop_to_alias(desktop):
+    """Map a lowercased desktop entry name to an installed Chromium browser alias."""
+    if not desktop:
+        return None
+    if "brave-origin" in desktop or "brave_origin" in desktop:
+        if any(_resolve_candidate(c) for c in BROWSER_ALIASES["brave-origin"]):
+            return "brave-origin"
+    elif "brave" in desktop:
+        if any(_resolve_candidate(c) for c in BROWSER_ALIASES["brave"]):
+            return "brave"
+        if any(_resolve_candidate(c) for c in BROWSER_ALIASES["brave-origin"]):
+            return "brave-origin"
+    elif "google-chrome" in desktop or "chrome" in desktop:
+        if any(_resolve_candidate(c) for c in BROWSER_ALIASES["google-chrome"]):
+            return "google-chrome"
+    elif "chromium" in desktop:
+        if any(_resolve_candidate(c) for c in BROWSER_ALIASES["chromium"]):
+            return "chromium"
+    elif "microsoft-edge" in desktop or "msedge" in desktop:
+        if any(_resolve_candidate(c) for c in BROWSER_ALIASES["microsoft-edge"]):
+            return "microsoft-edge"
+    return None
+
+
+def _detect_default_browser_alias():
+    """Return the canonical browser alias for the system default web browser, or None."""
+    for cmd in (
+        ["xdg-settings", "get", "default-web-browser"],
+        ["xdg-mime", "query", "default", "x-scheme-handler/http"],
+    ):
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+            if res.returncode == 0 and res.stdout.strip():
+                return _desktop_to_alias(res.stdout.strip().lower())
+        except Exception:
+            pass
+    return None
+
+
+def _browser_name_matches(raw):
+    """Return True when a /proc cmdline or binary path starts with a supported Chromium browser binary."""
+    if not raw:
+        return False
+    # Some Chromium builds rewrite /proc/<pid>/cmdline as space-separated tokens, and distro
+    # browser launchers may run under a shell/interpreter wrapper (e.g. /bin/sh /usr/bin/chromium-browser).
+    tokens = [t for t in re.split(r"[\0\s]+", raw) if t and not t.startswith("-")]
+    if not tokens:
+        return False
+    for tok in tokens[:5]:
+        if "=" in tok and not tok.startswith("/"):
+            continue
+        base = os.path.basename(tok).lower()
+        if base in _INTERPRETER_NAMES or re.match(r"^python3\.\d+$", base):
+            continue
+        if any(excl in base for excl in ("crashpad", "sandbox", "nacl_helper", "xdg-open", "firefox")):
+            return False
+        return any(b in base for b in ("chrome", "chromium", "brave", "msedge", "microsoft-edge"))
+    return False
+
+
+def _get_startup_wm_class(browser_cmd, host):
+    """Return the StartupWMClass matching install.sh so X11 (--class) and Wayland (app_id) report the same class."""
+    b_low = os.path.basename(browser_cmd).lower()
+    if "chrome" in b_low:
+        prefix = "chrome"
+    elif "chromium" in b_low:
+        prefix = "chromium"
+    elif "brave" in b_low:
+        prefix = "brave"
+    elif "edge" in b_low or "msedge" in b_low:
+        prefix = "msedge"
+    else:
+        return "open_design"
+    return f"{prefix}-{host}__-Default"
+
+
+def detect_browser(preferred="auto"):
+    """Find an installed Chromium-based browser that can open app-mode windows."""
+    pref = (preferred or "auto").strip()
+    if pref and pref.lower() != "auto":
+        lower_pref = pref.lower()
+        if "firefox" in lower_pref:
+            print(
+                "Error: Firefox on Linux does not support standalone '--app' window mode. "
+                "Use Google Chrome, Chromium, Brave, Brave Origin, or Microsoft Edge.",
+                file=sys.stderr,
+            )
+            return None
+        for candidate in BROWSER_ALIASES.get(lower_pref, []):
+            resolved = _resolve_candidate(candidate)
+            if resolved:
+                return resolved
+        direct = _resolve_candidate(pref)
+        if direct and _browser_name_matches(direct):
+            return direct
+        fallback = detect_browser("auto")
+        if fallback:
+            print(
+                f"Warning: Configured browser '{pref}' is not installed; falling back to '{fallback}'.",
+                file=sys.stderr,
+            )
+            return fallback
+        print(
+            f"Error: Configured browser '{pref}' is not available. "
+            "Re-run ./install.sh to select a supported Chromium browser.",
+            file=sys.stderr,
+        )
+        return None
+
+    default_alias = _detect_default_browser_alias()
+    if default_alias:
+        for candidate in BROWSER_ALIASES.get(default_alias, []):
+            resolved = _resolve_candidate(candidate)
+            if resolved:
+                return resolved
+
+    for alias_candidates in BROWSER_ALIASES.values():
+        for bin_name in alias_candidates:
+            found = _resolve_candidate(bin_name)
+            if found:
+                return found
+    return None
+
+
+def _pwa_dir_targets(pwa_dir):
+    """Return deduplicated normalized and realpath targets for pwa_dir."""
+    norm_p = os.path.normpath(pwa_dir)
+    real_p = os.path.realpath(pwa_dir)
+    return (norm_p,) if norm_p == real_p else (norm_p, real_p)
+
+
+def _cmdline_has_pwa_dir(raw, pwa_dir, _targets=None):
+    """Return True only when raw cmdline contains an exact --user-data-dir match for pwa_dir."""
+    if not raw or not pwa_dir:
+        return False
+    targets = _targets if _targets is not None else _pwa_dir_targets(pwa_dir)
+    # 1. NUL-delimited argv check (supports paths with spaces when kernel argv is intact).
+    # Do NOT return False early if this misses: Chromium/Brave main processes often rewrite
+    # /proc/<pid>/cmdline into a single space-joined string terminated by a trailing NUL.
+    if "\0" in raw:
+        args = [a for a in raw.split("\0") if a]
+        if len(args) > 1:
+            for i, arg in enumerate(args):
+                if arg.startswith("--user-data-dir="):
+                    cand = arg[len("--user-data-dir="):].strip("\"'")
+                    if os.path.normpath(cand) in targets or os.path.realpath(cand) in targets:
+                        return True
+                elif arg == "--user-data-dir" and i + 1 < len(args):
+                    cand = args[i + 1].strip("\"'")
+                    if os.path.normpath(cand) in targets or os.path.realpath(cand) in targets:
+                        return True
+    # 2. Substring + boundary check (handles space-joined cmdlines with or without trailing NULs)
+    for target in targets:
+        for prefix in (
+            f"--user-data-dir={target}",
+            f"--user-data-dir={target}/",
+            f'--user-data-dir="{target}"',
+            f'--user-data-dir="{target}/"',
+            f"--user-data-dir='{target}'",
+            f"--user-data-dir='{target}/'",
+            f"--user-data-dir {target}",
+            f"--user-data-dir {target}/",
+            f'--user-data-dir "{target}"',
+            f'--user-data-dir "{target}/"',
+            f"--user-data-dir '{target}'",
+            f"--user-data-dir '{target}/'",
+        ):
+            idx = raw.find(prefix)
+            while idx != -1:
+                end_idx = idx + len(prefix)
+                if end_idx == len(raw) or raw[end_idx] in ("\0", " ", "\t", '"', "'"):
+                    return True
+                idx = raw.find(prefix, idx + 1)
+    return False
+
+
+def is_pwa_browser_pid(pid, pwa_dir):
+    """Verify that a PID from SingletonLock is an active, non-zombie browser process for pwa_dir."""
+    if not pid or pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+            return False
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read().decode("utf-8", errors="ignore")
+        if not raw or "--type=" in raw:
+            return False
+        if not _cmdline_has_pwa_dir(raw, pwa_dir) or not _browser_name_matches(raw):
+            return False
+        return _is_pid_running(pid)
+    except (OSError, ValueError):
+        return False
+
+
+def get_pwa_browser_pids(pwa_dir):
+    """Return all live browser main processes owned by the current user using the Open Design profile."""
+    pids = []
+    if not pwa_dir:
+        return pids
+    my_uid = os.getuid()
+    my_pid = os.getpid()
+    targets = _pwa_dir_targets(pwa_dir)
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return pids
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == my_pid:
+            continue
+        try:
+            if os.stat(f"/proc/{entry}").st_uid != my_uid:
+                continue
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                raw = f.read().decode("utf-8", errors="ignore")
+        except OSError:
+            continue
+        if not raw or "--type=" in raw:
+            continue
+        if not _cmdline_has_pwa_dir(raw, pwa_dir, _targets=targets) or not _browser_name_matches(raw):
+            continue
+        if _is_pid_running(pid):
+            pids.append(pid)
+
+    return pids
+
+
+def clean_dead_locks(pwa_dir):
+    """Clean Chromium singleton lock if its target process is dead or PID was recycled."""
+    lock_path = os.path.join(pwa_dir, "SingletonLock")
+    if os.path.islink(lock_path):
+        alive = False
+        try:
+            target = os.readlink(lock_path)
+            pid = int(target.rsplit("-", 1)[-1])
+            alive = is_pwa_browser_pid(pid, pwa_dir)
+        except (ValueError, OSError):
+            alive = False
+        if not alive:
+            for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+                try:
+                    os.unlink(os.path.join(pwa_dir, name))
+                except OSError:
+                    pass
+
+
+def send_notify(title, message):
+    """Send desktop notification."""
+    if shutil.which("notify-send"):
+        icon_arg = os.path.expanduser("~/.local/share/icons/hicolor/512x512/apps/open_design.png")
+        if not os.path.isfile(icon_arg):
+            icon_arg = "open_design"
+        try:
+            subprocess.Popen(
+                [
+                    "notify-send",
+                    "-a",
+                    "Open Design",
+                    "-i",
+                    icon_arg,
+                    title,
+                    message,
+                ],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            pass
+
+
+def _get_runtime_dir():
+    """Return a private, user-owned, writable runtime directory for lock and pid files."""
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir and not os.path.islink(runtime_dir) and os.path.isdir(runtime_dir):
+        try:
+            st = os.stat(runtime_dir)
+            if st.st_uid == os.getuid() and not (st.st_mode & 0o077) and os.access(runtime_dir, os.W_OK):
+                return runtime_dir
+        except OSError:
+            pass
+    fallback = os.path.expanduser("~/.config/open-design")
+    os.makedirs(fallback, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(fallback, 0o700)
+    except OSError:
+        pass
+    return fallback
+
+
+def get_update_lock_path():
+    """Resolve runtime path for the updater window singleton lock file."""
+    return os.path.join(_get_runtime_dir(), "open-design-update.lock")
+
+
+def get_active_update_lock_path():
+    """Resolve runtime path for the active update installation lock file."""
+    return os.path.join(_get_runtime_dir(), "open-design-updating.lock")
+
+
+def get_server_pid_path():
+    """Resolve runtime path for the tracked background server PID file."""
+    return os.path.join(_get_runtime_dir(), "open-design-server.pid")
+
+
+def _acquire_lock_file(lock_path):
+    """Open lock_path with 0600 permissions and acquire a non-blocking exclusive flock."""
+    lock_file = None
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        lock_file = os.fdopen(fd, "a+", encoding="utf-8")
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_file
+    except (BlockingIOError, OSError):
+        if lock_file is not None:
+            try:
+                lock_file.close()
+            except OSError:
+                pass
+        return None
+
+
+def get_start_lock():
+    """Serialize launches so a double-click cannot start two servers or windows."""
+    return _acquire_lock_file(os.path.join(_get_runtime_dir(), "open-design-start.lock"))
+
+
+def get_active_update_lock():
+    """Acquire a non-blocking lock held strictly while an update installation is actively running."""
+    lock_path = get_active_update_lock_path()
+    return _acquire_lock_file(lock_path), lock_path
+
+
+def is_update_in_progress():
+    """Return True only when an update installation is actively modifying the repository."""
+    lock_path = get_active_update_lock_path()
+    if not os.path.exists(lock_path):
+        return False
+    lock_file = _acquire_lock_file(lock_path)
+    if lock_file is None:
+        return True
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        lock_file.close()
+    except OSError:
+        pass
+    return False
+
+
+def get_update_lock():
+    """Acquire a non-blocking user-private file lock to prevent concurrent update dialogs."""
+    lock_path = get_update_lock_path()
+    return _acquire_lock_file(lock_path), lock_path
+
+
+def release_update_lock(lock_file, lock_path):
+    """Unlink the lock path while still holding LOCK_EX, then close to avoid a race window."""
+    if lock_file is None:
+        return
+    try:
+        if lock_path and os.path.exists(lock_path):
+            os.unlink(lock_path)
+    except OSError:
+        pass
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        lock_file.close()
+    except OSError:
+        pass
+
+
+def clean_ver_str(ver):
+    """Format a version string or tag into a clean 'vX.Y.Z' display string, preserving 'unknown'."""
+    if not ver:
+        return "unknown"
+    ver = ver.strip()
+    if ver.lower() in ("unknown", "vunknown"):
+        return "unknown"
+    if ver.startswith("open-design-v"):
+        ver = ver[len("open-design-v"):]
+    elif ver.startswith("v"):
+        ver = ver[1:]
+    if not ver or ver.lower() == "unknown":
+        return "unknown"
+    return "v" + ver
+
+
+def parse_ver(t):
+    """Parse a version tag into a comparable tuple where stable releases sort above pre-releases."""
+    if not t:
+        return (0, 0, 0, 0, ())
+    raw = t.strip()
+    if raw.startswith("open-design-v"):
+        raw = raw[len("open-design-v"):]
+    elif raw.startswith("v"):
+        raw = raw[1:]
+    if not raw or raw.lower() == "unknown":
+        return (0, 0, 0, 0, ())
+    main_part, sep, pre_part = raw.partition("-")
+    nums = []
+    for x in main_part.split("."):
+        m = re.match(r"^(\d+)", x)
+        nums.append(int(m.group(1)) if m else 0)
+    while len(nums) < 3:
+        nums.append(0)
+    is_stable = 0 if sep else 1
+    pre_tokens = (
+        tuple((0, int(p)) if p.isdigit() else (1, p.lower()) for p in re.findall(r"\d+|[A-Za-z]+", pre_part))
+        if sep
+        else ()
+    )
+    return (nums[0], nums[1], nums[2], is_stable, pre_tokens)
+
+
+def get_installed_version(repo_dir, current_tag=None):
+    """Resolve current release version from git tag, packaged manifest, or root manifest."""
+    if current_tag:
+        return current_tag.strip().replace("open-design-v", "").lstrip("v")
+    try:
+        cur_res = subprocess.run(
+            ["git", "describe", "--tags", "--exact-match", "--match", "open-design-v*"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if cur_res.returncode == 0 and cur_res.stdout.strip():
+            raw = cur_res.stdout.strip()
+            return raw.replace("open-design-v", "").lstrip("v")
+    except Exception:
+        pass
+
+    for rel in ("apps/packaged/package.json", "package.json", "apps/daemon/package.json"):
+        path = os.path.join(repo_dir, rel)
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    v = json.load(f).get("version")
+                    if v:
+                        return v.strip().lstrip("v")
+            except Exception:
+                pass
+    return "unknown"
+
+
+def get_current_git_ref(repo_dir):
+    """Resolve an exact, restorable git reference (branch, tag, or commit SHA) for rollback."""
+    for cmd in (
+        ["git", "symbolic-ref", "-q", "--short", "HEAD"],
+        ["git", "describe", "--tags", "--exact-match"],
+        ["git", "rev-parse", "--verify", "HEAD"],
+    ):
+        try:
+            res = subprocess.run(cmd, cwd=repo_dir, capture_output=True, text=True, timeout=3)
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+        except Exception:
+            pass
+    return None
+
+
+def get_pids_for_port(port):
+    """Find process IDs listening on a specific TCP port via ss or /proc/net/tcp fallback."""
+    valid_p = _valid_port(port)
+    if not valid_p:
+        return []
+    port_num = int(valid_p)
+    pids = set()
+
+    # Prefer ss (iproute2) if available; restrict to TCP listeners only
+    ss_bin = shutil.which("ss") or (
+        "/usr/sbin/ss" if os.path.exists("/usr/sbin/ss") else ("/sbin/ss" if os.path.exists("/sbin/ss") else None)
+    )
+    if ss_bin:
+        try:
+            out = subprocess.check_output(
+                [ss_bin, "-tlpn", f"sport = :{port_num}"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            )
+            for m in re.finditer(r"pid=(\d+)", out):
+                pids.add(int(m.group(1)))
+            if pids:
+                return list(pids)
+        except Exception:
+            pass
+
+    # Pure-Python fallback via /proc/net/tcp and /proc/net/tcp6
+    target_inodes = set()
+    hex_port = f"{port_num:04X}"
+    for net_file in ("/proc/net/tcp", "/proc/net/tcp6"):
+        if not os.path.exists(net_file):
+            continue
+        try:
+            with open(net_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f.readlines()[1:]:
+                    parts = line.split()
+                    if len(parts) >= 10 and parts[3] == "0A":
+                        local_port = parts[1].rsplit(":", 1)[-1].upper()
+                        if local_port == hex_port and parts[9] != "0":
+                            target_inodes.add(f"socket:[{parts[9]}]")
+        except OSError:
+            pass
+
+    if not target_inodes:
+        return []
+
+    my_uid = os.getuid()
+    for pid_dir in glob.glob("/proc/[0-9]*"):
+        try:
+            if os.stat(pid_dir).st_uid != my_uid:
+                continue
+            pid = int(os.path.basename(pid_dir))
+            fd_dir = os.path.join(pid_dir, "fd")
+            for fd_name in os.listdir(fd_dir):
+                try:
+                    if os.readlink(os.path.join(fd_dir, fd_name)) in target_inodes:
+                        pids.add(pid)
+                        break
+                except OSError:
+                    pass
+        except (OSError, ValueError):
+            pass
+
+    return list(pids)
+
+
+def _path_matches_repo(candidate_path, repo_path):
+    """Return True only when candidate_path is exactly repo_path or a direct descendant."""
+    if not candidate_path:
+        return False
+    return candidate_path == repo_path or candidate_path.startswith(repo_path + os.sep)
+
+
+def _has_open_design_service_signature(cmd_joined):
+    """Return True only when cmdline matches an Open Design daemon, web sidecar, or tools-dev server process."""
+    # Exclude package-management and build invocations so manual or updater builds are never killed
+    if re.search(r"\bpnpm\b.*\b(install|build|typecheck|lint|test|clean)\b", cmd_joined):
+        return False
+    service_markers = (
+        "tools-dev",
+        "tools/dev",
+        "next-server",
+        "--od-stamp-",
+        "apps/web/sidecar",
+        "apps/daemon/sidecar",
+        "apps/daemon/dist",
+        "apps/daemon/src",
+        "@open-design/daemon",
+        "@open-design/web",
+    )
+    return any(m in cmd_joined for m in service_markers)
+
+
+def get_repo_pids(repo_path):
+    """Find running Open Design service process IDs belonging to the local repository.
+
+    Uses uid filtering, /proc/<pid>/cwd resolution, path-boundary matching, and
+    Open Design service signatures so unrelated user node/pnpm processes in the
+    checkout directory are never terminated.
+    """
+    if not repo_path or not os.path.isdir(repo_path):
+        return []
+    repo_path = os.path.realpath(repo_path)
+    repo_base = os.path.basename(repo_path)
+    pids = set()
+    my_pid = os.getpid()
+    my_uid = os.getuid()
+    keywords = ("node", "tsx", "supervisor", "next", "pnpm")
+
+    for pid_dir in glob.glob("/proc/[0-9]*"):
+        try:
+            if os.stat(pid_dir).st_uid != my_uid:
+                continue
+            pid = int(os.path.basename(pid_dir))
+            if pid == my_pid:
+                continue
+            with open(os.path.join(pid_dir, "cmdline"), "rb") as f:
+                raw_bytes = f.read()
+            if not raw_bytes:
+                continue
+            args = [a.decode("utf-8", errors="ignore") for a in raw_bytes.split(b"\0") if a]
+            cmd_joined = " ".join(args).lower()
+            if not any(k in cmd_joined for k in keywords):
+                continue
+            if not _has_open_design_service_signature(cmd_joined):
+                continue
+
+            matched = False
+            try:
+                proc_cwd = os.path.realpath(os.path.join(pid_dir, "cwd"))
+                if _path_matches_repo(proc_cwd, repo_path):
+                    matched = True
+            except OSError:
+                pass
+
+            if not matched:
+                for arg in args:
+                    if arg.startswith("-"):
+                        continue
+                    if _path_matches_repo(arg, repo_path):
+                        matched = True
+                        break
+                    if ("/" in arg or repo_base in arg) and os.path.exists(arg):
+                        real_arg = os.path.realpath(arg)
+                        if _path_matches_repo(real_arg, repo_path):
+                            matched = True
+                            break
+
+            if matched and _is_pid_running(pid):
+                pids.add(pid)
+        except (OSError, ValueError):
+            pass
+
+    return list(pids)
+
+
+def _is_pid_running(pid):
+    """Return True if a PID exists and is not a zombie."""
+    try:
+        os.kill(pid, 0)
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="ignore") as f:
+            stat_str = f.read()
+        rparen = stat_str.rfind(")")
+        if rparen != -1:
+            state = stat_str[rparen + 2 : rparen + 3]
+            return state != "Z"
+        return True
+    except OSError:
+        return False
+
+
+def _get_pid_starttime(pid):
+    """Return the kernel start-time ticks (field 22 of /proc/<pid>/stat) or None."""
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="ignore") as f:
+            stat_str = f.read()
+        rparen = stat_str.rfind(")")
+        if rparen != -1:
+            fields = stat_str[rparen + 2 :].split()
+            if len(fields) >= 20:
+                return int(fields[19])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _has_tracked_proc_keyword(pid):
+    """Return True if /proc/<pid>/cmdline is owned by current user and matches a server process keyword."""
+    try:
+        if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+            return False
+        with open(f"/proc/{pid}/cmdline", "rb") as cf:
+            raw = cf.read().decode("utf-8", errors="ignore").lower()
+        return any(k in raw for k in ("node", "tsx", "supervisor", "next", "pnpm", "open-design"))
+    except OSError:
+        return False
+
+
+def _read_tracked_pids():
+    """Read all verified live server/sidecar PIDs and PGIDs from the pid file."""
+    pid_path = get_server_pid_path()
+    if not os.path.exists(pid_path):
+        return []
+    live = []
+    my_uid = os.getuid()
+    try:
+        with open(pid_path, "r", encoding="utf-8") as f:
+            tokens = [t.strip() for t in f.read().split() if t.strip()]
+        for raw_val in tokens:
+            parts = raw_val.split(":")
+            try:
+                pgid = int(parts[0])
+            except ValueError:
+                continue
+            expected_start = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+            if pgid <= 0:
+                continue
+
+            if _is_pid_running(pgid):
+                if expected_start is not None:
+                    actual_start = _get_pid_starttime(pgid)
+                    if actual_start is not None and actual_start != expected_start:
+                        continue
+                if _has_tracked_proc_keyword(pgid):
+                    if pgid not in live:
+                        live.append(pgid)
+                    continue
+
+            for pid_dir in glob.glob("/proc/[0-9]*"):
+                try:
+                    if os.stat(pid_dir).st_uid != my_uid:
+                        continue
+                    cand_pid = int(os.path.basename(pid_dir))
+                    if os.getpgid(cand_pid) == pgid and _is_pid_running(cand_pid) and _has_tracked_proc_keyword(cand_pid):
+                        if pgid not in live:
+                            live.append(pgid)
+                        if cand_pid not in live:
+                            live.append(cand_pid)
+                except (OSError, ValueError):
+                    pass
+    except OSError:
+        pass
+    return live
+
+
+def _read_tracked_pgid():
+    """Return the primary tracked server PID/PGID if any tracked server or sidecar process is alive."""
+    live = _read_tracked_pids()
+    return live[0] if live else None
+
+
+def _is_in_tracked_pgid(pid, tracked_pgid):
+    """Return True if pid matches any tracked server/sidecar PID or belongs to a tracked process group."""
+    if pid <= 0:
+        return False
+    tracked_set = set(_read_tracked_pids())
+    if isinstance(tracked_pgid, int) and tracked_pgid > 0:
+        tracked_set.add(tracked_pgid)
+    elif isinstance(tracked_pgid, (list, tuple, set)):
+        tracked_set.update(int(x) for x in tracked_pgid if isinstance(x, int) and x > 0)
+    if not tracked_set:
+        return False
+    if pid in tracked_set:
+        return True
+    try:
+        return os.getpgid(pid) in tracked_set
+    except OSError:
+        return False
+
+
+def _write_tracked_pgid(pids):
+    """Write tracked server/sidecar PIDs and their kernel start times with 0600 permissions."""
+    if isinstance(pids, int):
+        pids = [pids]
+    entries = []
+    seen = set()
+    for raw_p in pids or []:
+        try:
+            p = int(raw_p)
+        except (TypeError, ValueError):
+            continue
+        if p <= 0:
+            continue
+        cands = [p]
+        try:
+            pg = os.getpgid(p)
+            if pg > 0 and pg not in cands:
+                cands.append(pg)
+        except OSError:
+            pass
+        for c in cands:
+            if c in seen:
+                continue
+            seen.add(c)
+            start_ticks = _get_pid_starttime(c)
+            entries.append(f"{c}:{start_ticks}" if start_ticks is not None else str(c))
+    if not entries:
+        return
+    pid_path = get_server_pid_path()
+    try:
+        fd = os.open(pid_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as pf:
+            pf.write("\n".join(entries) + "\n")
+    except OSError:
+        pass
+
+
+def _clear_tracked_pgid():
+    """Remove the server pid file."""
+    pid_path = get_server_pid_path()
+    try:
+        if os.path.exists(pid_path):
+            os.unlink(pid_path)
+    except OSError:
+        pass
+
+
+def _terminate_proc_group(proc):
+    """Terminate a subprocess and its entire process group cleanly."""
+    if proc is None:
+        return
+    pgid = proc.pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+    for _ in range(4):
+        if proc.poll() is not None:
+            break
+        time.sleep(0.03)
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=0.5)
+    except Exception:
+        pass
+
+
+def _check_not_root():
+    if os.geteuid() == 0:
+        print("Error: Do not run open-design as root or with sudo.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_start():
+    """Launch Open Design web services and PWA window."""
+    _check_not_root()
+    cfg = load_config()
+
+    start_lock = get_start_lock()
+    if start_lock is None:
+        print("Open Design is already starting.")
+        send_notify("Open Design", "Application is already starting.")
+        return
+
+    try:
+        if is_update_in_progress():
+            send_notify("Update in Progress", "Open Design is currently updating. Please wait a moment.")
+            return
+
+        if not os.path.isdir(cfg["repo"]):
+            print(f"Error: Open Design repository not found at {cfg['repo']}")
+            send_notify("Open Design", "Repository directory not found. Please check configuration.")
+            sys.exit(1)
+
+        stamp_path = os.path.expanduser("~/.config/open-design/build-stamp")
+        if os.path.isfile(stamp_path):
+            try:
+                with open(stamp_path, "r", encoding="utf-8") as sf:
+                    stamp_val = sf.read().strip()
+                if stamp_val.startswith("pending:"):
+                    print(
+                        "Error: A previous build or update was interrupted before completion. "
+                        "Re-run './install.sh' to repair the installation.",
+                        file=sys.stderr,
+                    )
+                    send_notify(
+                        "Repair Required",
+                        "A previous update was interrupted. Please re-run ./install.sh to complete the build.",
+                    )
+                    sys.exit(1)
+            except OSError:
+                pass
+
+        if os.path.islink(cfg["pwa_dir"]):
+            print(
+                f"Error: Configured profile directory '{cfg['pwa_dir']}' must not be a symlink.",
+                file=sys.stderr,
+            )
+            send_notify("Open Design", "Configured profile directory must not be a symlink.")
+            sys.exit(1)
+
+        marker_path = os.path.join(cfg["pwa_dir"], ".open-design-profile")
+        if os.path.isdir(cfg["pwa_dir"]) and not os.path.isfile(marker_path):
+            try:
+                existing_entries = os.listdir(cfg["pwa_dir"])
+            except OSError:
+                existing_entries = None
+            if existing_entries is None or existing_entries:
+                print(
+                    f"Error: Configured profile directory '{cfg['pwa_dir']}' is non-empty and was not created by Open Design.",
+                    file=sys.stderr,
+                )
+                send_notify("Open Design", "Configured profile directory is non-empty and lacks profile marker.")
+                sys.exit(1)
+
+        os.makedirs(cfg["pwa_dir"], mode=0o700, exist_ok=True)
+        try:
+            os.chmod(cfg["pwa_dir"], 0o700)
+        except OSError:
+            pass
+        try:
+            if not os.path.exists(marker_path):
+                with open(marker_path, "w", encoding="utf-8") as mf:
+                    mf.write("Open Design Desktop profile\n")
+        except OSError:
+            pass
+        clean_dead_locks(cfg["pwa_dir"])
+
+        url = f"http://{cfg['host']}:{cfg['port']}"
+        server_up = is_server_running(cfg["host"], cfg["port"])
+
+        if server_up:
+            # Port is occupied — verify it belongs to our tracked server or repo processes
+            tracked_pgid = _read_tracked_pgid()
+            if tracked_pgid is None:
+                repo_pids = get_repo_pids(cfg["repo"])
+                if not repo_pids:
+                    port_pids = get_pids_for_port(cfg["port"])
+                    pid_suffix = f" (PID {port_pids[0]})" if port_pids else ""
+                    print(f"Error: Port {cfg['port']} is already in use by another application{pid_suffix}.")
+                    send_notify(
+                        "Port Conflict",
+                        f"Port {cfg['port']} is in use by another application. Use a different port.",
+                    )
+                    sys.exit(1)
+
+            # Fast path: if the server is up and the app window is already open, exit immediately
+            # without spawning xdg-settings or checking Node/pnpm.
+            if get_pwa_browser_pids(cfg["pwa_dir"]):
+                print("Open Design is already open.")
+                send_notify("Open Design", "Application is already open.")
+                return
+
+        # Validate browser availability before starting the background server so a missing
+        # browser fails immediately without leaving an orphaned background server running.
+        browser = detect_browser(cfg["browser"])
+        if not browser:
+            if (cfg["browser"] or "auto").strip().lower() == "auto":
+                print("Error: No supported Chromium-based browser found.", file=sys.stderr)
+                print(
+                    "Install Google Chrome, Chromium, Brave, Brave Origin, or Microsoft Edge, then re-run ./install.sh.",
+                    file=sys.stderr,
+                )
+            send_notify("Open Design", "No supported Chromium-based browser was found.")
+            sys.exit(1)
+
+        if not server_up:
+            ensure_node_in_path()
+            ok_node, node_ver = _has_node24_runtime()
+            if not ok_node:
+                print(
+                    f"Error: Node.js 24.x LTS is required to start Open Design (found {node_ver}).",
+                    file=sys.stderr,
+                )
+                send_notify("Open Design", f"Node.js 24.x LTS is required (found {node_ver}).")
+                sys.exit(1)
+            if not shutil.which("pnpm"):
+                print("Error: 'pnpm' package manager was not found in PATH.", file=sys.stderr)
+                send_notify("Open Design", "pnpm was not found. Please ensure Node.js and pnpm are installed.")
+                sys.exit(1)
+            ok_pnpm, pnpm_info = _has_pnpm_node24()
+            if not ok_pnpm:
+                print(
+                    f"Error: pnpm must run under Node.js 24.x LTS ({pnpm_info}). Re-run './install.sh' to repair.",
+                    file=sys.stderr,
+                )
+                send_notify("Open Design", "pnpm is not running under Node.js 24.x LTS.")
+                sys.exit(1)
+
+            env = os.environ.copy()
+            env["NODE_OPTIONS"] = env.get("NODE_OPTIONS", "--max-old-space-size=4096")
+
+            # Inject authoritative release version and channel for upstream daemon & web
+            app_ver = get_installed_version(cfg["repo"])
+            if app_ver and app_ver != "unknown":
+                env["OD_APP_VERSION"] = app_ver
+                env["OD_RELEASE_CHANNEL"] = "stable"
+
+            has_build = (
+                os.path.isfile(os.path.join(cfg["repo"], "apps", "web", ".next", "BUILD_ID"))
+                and os.path.isdir(os.path.join(cfg["repo"], "apps", "daemon", "dist"))
+            )
+            cmd = ["pnpm", "tools-dev", "start", "web", "--web-port", cfg["port"]]
+            if has_build:
+                cmd.append("--prod")
+            log_dir = os.path.expanduser("~/.config/open-design")
+            os.makedirs(log_dir, mode=0o700, exist_ok=True)
+            log_file = os.path.join(log_dir, "server.log")
+            log_fd = os.open(log_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+            with os.fdopen(log_fd, "w", encoding="utf-8") as lf:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=cfg["repo"],
+                    env=env,
+                    stdout=lf,
+                    stderr=lf,
+                    start_new_session=True,
+                )
+
+            _write_tracked_pgid(proc.pid)
+
+            # Poll readiness with immediate crash detection
+            ready = False
+            start_time = time.time()
+            timeout = 35.0
+            rebuilt_tools = False
+            proc_exited_zero_at = None
+
+            while time.time() - start_time < timeout:
+                if is_http_ready(cfg["host"], cfg["port"]):
+                    ready = True
+                    break
+
+                if proc.poll() is not None:
+                    # Process exited — try tools-dev auto-heal once for hash-mismatch errors
+                    if proc.returncode != 0 and not rebuilt_tools:
+                        try:
+                            with open(log_file, "r", encoding="utf-8", errors="ignore") as lf:
+                                log_content = lf.read()
+                            if "dist build metadata hash mismatch" in log_content:
+                                print("Detected tools-dev metadata mismatch after git checkout. Auto-rebuilding tools-dev...")
+                                subprocess.run(
+                                    ["pnpm", "--filter", "@open-design/tools-dev", "build"],
+                                    cwd=cfg["repo"],
+                                    env=env,
+                                    capture_output=True,
+                                    timeout=15,
+                                )
+                                rebuilt_tools = True
+                                log_fd = os.open(log_file, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+                                with os.fdopen(log_fd, "w", encoding="utf-8") as lf:
+                                    proc = subprocess.Popen(
+                                        cmd,
+                                        cwd=cfg["repo"],
+                                        env=env,
+                                        stdout=lf,
+                                        stderr=lf,
+                                        start_new_session=True,
+                                    )
+                                _write_tracked_pgid(proc.pid)
+                                start_time = time.time()
+                                proc_exited_zero_at = None
+                                continue
+                        except Exception:
+                            pass
+                    # tools-dev start is a background starter that exits 0 once detached sidecars are spawned
+                    if proc.returncode == 0:
+                        if proc_exited_zero_at is None:
+                            proc_exited_zero_at = time.time()
+                        if is_http_ready(cfg["host"], cfg["port"]):
+                            ready = True
+                            break
+                        if (
+                            get_repo_pids(cfg["repo"])
+                            or get_pids_for_port(cfg["port"])
+                            or (time.time() - proc_exited_zero_at) < 2.0
+                        ):
+                            time.sleep(0.05)
+                            continue
+                    break
+
+                time.sleep(0.05)
+
+            if not ready:
+                _terminate_proc_group(proc)
+                stop_services(cfg, close_browser=False, force_tools_stop=True)
+                _clear_tracked_pgid()
+                print(f"Error: Failed to connect to Open Design on {url}.")
+                print(f"Server log: {log_file}")
+                send_notify("Unable to Start", "The background service could not be started. Try restarting the application.")
+                sys.exit(1)
+
+            # Record verified Open Design sidecar and port-listener PIDs with their kernel start times
+            repo_real = os.path.realpath(cfg["repo"])
+            repo_service_pids = set(get_repo_pids(cfg["repo"]))
+            active_pids = list(repo_service_pids)
+            for port_pid in get_pids_for_port(cfg["port"]):
+                if port_pid in repo_service_pids:
+                    continue
+                try:
+                    if os.getpgid(port_pid) == proc.pid:
+                        active_pids.append(port_pid)
+                        continue
+                except OSError:
+                    pass
+                try:
+                    if _path_matches_repo(os.path.realpath(f"/proc/{port_pid}/cwd"), repo_real) and _has_tracked_proc_keyword(port_pid):
+                        active_pids.append(port_pid)
+                except OSError:
+                    pass
+            if proc.poll() is None:
+                active_pids.append(proc.pid)
+            if active_pids:
+                _write_tracked_pgid(active_pids)
+            else:
+                _clear_tracked_pgid()
+
+        if get_pwa_browser_pids(cfg["pwa_dir"]):
+            print("Open Design is already open.")
+            send_notify("Open Design", "Application is already open.")
+            return
+
+        wm_class = _get_startup_wm_class(browser, cfg["host"])
+        try:
+            browser_proc = subprocess.Popen(
+                [
+                    browser,
+                    "--no-first-run",
+                    "--disable-features=Vulkan",
+                    f"--class={wm_class}",
+                    f"--user-data-dir={cfg['pwa_dir']}",
+                    f"--app={url}",
+                    "--start-maximized",
+                ],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as e:
+            if not server_up:
+                stop_services(cfg)
+            print(f"Error: Failed to launch browser '{browser}': {e}", file=sys.stderr)
+            send_notify("Open Design", "Failed to launch the configured browser.")
+            sys.exit(1)
+
+        # Hold the launch lock until the browser process appears, closing the
+        # window where a second click could start a duplicate app window.
+        window_detected = False
+        for _ in range(80):
+            if is_pwa_browser_pid(browser_proc.pid, cfg["pwa_dir"]) or get_pwa_browser_pids(cfg["pwa_dir"]):
+                window_detected = True
+                break
+            if browser_proc.poll() is not None:
+                if get_pwa_browser_pids(cfg["pwa_dir"]):
+                    window_detected = True
+                break
+            time.sleep(0.025)
+
+        if not window_detected and browser_proc.poll() is not None:
+            if not server_up:
+                stop_services(cfg)
+            rc = browser_proc.poll()
+            print(f"Error: Browser '{browser}' exited before opening an Open Design app window (exit code {rc}).", file=sys.stderr)
+            send_notify("Open Design", "Browser exited before opening the application window.")
+            sys.exit(1)
+    finally:
+        try:
+            start_lock.close()
+        except OSError:
+            pass
+
+
+def stop_services(cfg, close_browser=True, force_tools_stop=False):
+    """Cleanly terminate running browser and Open Design background services."""
+    repo_pids = get_repo_pids(cfg["repo"]) if os.path.isdir(cfg["repo"]) else []
+    tracked_pids = _read_tracked_pids()
+    port_pids = get_pids_for_port(cfg["port"])
+    # Only kill port-holding processes that are confirmed Open Design processes
+    verified_port_pids = [
+        p for p in port_pids if p in repo_pids or _is_in_tracked_pgid(p, tracked_pids)
+    ]
+
+    browser_pids = get_pwa_browser_pids(cfg["pwa_dir"]) if close_browser else []
+    browser_running = bool(browser_pids)
+    if close_browser:
+        for pid in browser_pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+    if not force_tools_stop and not browser_running and not repo_pids and not verified_port_pids and not tracked_pids:
+        return False
+
+    # 1. Attempt graceful stop via pnpm tools-dev stop
+    if os.path.isdir(cfg["repo"]) and shutil.which("pnpm") and (force_tools_stop or repo_pids or verified_port_pids or tracked_pids):
+        try:
+            subprocess.run(
+                ["pnpm", "tools-dev", "stop"],
+                cwd=cfg["repo"],
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+    # Terminate tracked server/sidecar processes and their process groups
+    for tpid in tracked_pids:
+        try:
+            os.killpg(tpid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            os.kill(tpid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    # Wait up to 3s for the port, repo processes, and browsers to close.
+    for _ in range(30):
+        browser_gone = (not get_pwa_browser_pids(cfg["pwa_dir"])) if close_browser else True
+        if (
+            not is_server_running(cfg["host"], cfg["port"])
+            and not get_repo_pids(cfg["repo"])
+            and not _read_tracked_pids()
+            and browser_gone
+        ):
+            break
+        time.sleep(0.1)
+
+    if close_browser:
+        remaining_browser_pids = get_pwa_browser_pids(cfg["pwa_dir"])
+        if remaining_browser_pids:
+            for p in remaining_browser_pids:
+                try:
+                    os.kill(p, signal.SIGKILL)
+                except OSError:
+                    pass
+            time.sleep(0.2)
+        browser_stopped = not get_pwa_browser_pids(cfg["pwa_dir"])
+    else:
+        browser_stopped = True
+
+    # Clean singleton files only once the browser is gone (or was never running).
+    if close_browser and (not browser_running or browser_stopped):
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            try:
+                os.unlink(os.path.join(cfg["pwa_dir"], name))
+            except OSError:
+                pass
+
+    # 2. Hard fallback: terminate stubborn processes attached to the repo or tracked sidecars
+    remaining_repo_pids = set(get_repo_pids(cfg["repo"]))
+    remaining_tracked_pids = set(_read_tracked_pids())
+    remaining_port_pids = {
+        p for p in get_pids_for_port(cfg["port"])
+        if p in remaining_repo_pids or _is_in_tracked_pgid(p, tracked_pids)
+    }
+    remaining_pids = remaining_repo_pids | remaining_tracked_pids | remaining_port_pids
+    if remaining_pids:
+        for p in remaining_pids:
+            try:
+                os.killpg(p, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                os.kill(p, signal.SIGTERM)
+            except OSError:
+                pass
+        time.sleep(0.5)
+
+        for p in remaining_pids:
+            try:
+                os.killpg(p, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+        time.sleep(0.1)
+
+    had_owned_server = bool(repo_pids or verified_port_pids or tracked_pids)
+    still_owned_port = {
+        p for p in get_pids_for_port(cfg["port"])
+        if p in set(get_repo_pids(cfg["repo"])) or _is_in_tracked_pgid(p, tracked_pids)
+    }
+    if not still_owned_port and not _read_tracked_pids():
+        _clear_tracked_pgid()
+    port_busy = is_server_running(cfg["host"], cfg["port"]) if had_owned_server else False
+    return not get_repo_pids(cfg["repo"]) and not _read_tracked_pids() and not still_owned_port and not port_busy and browser_stopped
+
+
+def cmd_stop(quiet=False):
+    """Stop Open Design background services and close PWA window."""
+    if is_update_in_progress():
+        if not quiet:
+            send_notify("Update in Progress", "Cannot stop services while an update is actively installing.")
+        print("Error: Open Design is currently updating. Please wait or cancel the update first.", file=sys.stderr)
+        sys.exit(1)
+
+    cfg = load_config()
+    ensure_node_in_path()
+
+    repo_pids = get_repo_pids(cfg["repo"]) if os.path.isdir(cfg["repo"]) else []
+    tracked_pgid = _read_tracked_pgid()
+    port_pids = get_pids_for_port(cfg["port"])
+    verified_port_pids = [
+        p for p in port_pids if p in repo_pids or _is_in_tracked_pgid(p, tracked_pgid)
+    ]
+    browser_active = bool(get_pwa_browser_pids(cfg["pwa_dir"]))
+    if not browser_active and os.path.isdir(cfg["pwa_dir"]):
+        clean_dead_locks(cfg["pwa_dir"])
+
+    if not repo_pids and not verified_port_pids and not browser_active and tracked_pgid is None:
+        if not quiet:
+            send_notify("Open Design", "Server is not running.")
+        print("Open Design server is not running.")
+        return
+
+    stopped = stop_services(cfg)
+    if stopped:
+        if not quiet:
+            send_notify("Open Design", "Application and background server stopped.")
+        print("Open Design stopped successfully.")
+    else:
+        if not quiet:
+            send_notify("Open Design", "Failed to stop background server.")
+        print("Error: Could not terminate the application or background server.")
+        sys.exit(1)
+
+
+def cmd_update():
+    """Open unified GTK4 update dialog."""
+    _check_not_root()
+    cfg = load_config()
+    ensure_node_in_path()
+
+    if not os.path.isdir(cfg["repo"]):
+        print(f"Error: Open Design repository not found at {cfg['repo']}")
+        send_notify("Open Design", "Repository directory not found.")
+        sys.exit(1)
+
+    if not shutil.which("git"):
+        print("Error: 'git' is required to check for and apply updates.")
+        send_notify("Open Design", "Git was not found in PATH.")
+        sys.exit(1)
+
+    ok_node, node_ver = _has_node24_runtime()
+    if not ok_node:
+        print(
+            f"Error: Node.js 24.x LTS is required to update Open Design (found {node_ver}).",
+            file=sys.stderr,
+        )
+        send_notify("Open Design", f"Node.js 24.x LTS is required (found {node_ver}).")
+        sys.exit(1)
+    ok_pnpm, pnpm_info = _has_pnpm_node24()
+    if not ok_pnpm:
+        print(
+            f"Error: pnpm 10.x (>=10.33.2) running under Node.js 24 is required ({pnpm_info}). Re-run './install.sh' to repair.",
+            file=sys.stderr,
+        )
+        send_notify("Open Design", "Valid pnpm 10.x (Node 24) was not found.")
+        sys.exit(1)
+
+    lock_file, lock_path = get_update_lock()
+    if lock_file is None:
+        send_notify("Open Design", "Another update check is already in progress.")
+        return
+
+    try:
+        import gi
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Adw", "1")
+        from gi.repository import Gtk, Adw, Gdk, GLib
+        import cairo
+    except Exception as e:
+        print(f"Error: PyGObject with GTK4/Libadwaita is required for update dialog ({e}).")
+        send_notify("Open Design", "GTK4 and Libadwaita are required for the update manager.")
+        release_update_lock(lock_file, lock_path)
+        sys.exit(1)
+
+    result = {"action": "closed", "worker_thread": None}
+    app = Adw.Application(application_id="org.opendesign.Updater")
+
+    custom_css = b"""
+    window.update-window,
+    window.background.update-window,
+    .update-window,
+    .update-window > contents {
+        background-color: #121215;
+        color: #f4f4f5;
+        border-radius: 16px;
+        border: 1px solid #27272a;
+    }
+    .headerbar { background: transparent; border: none; box-shadow: none; }
+    .dialog-title {
+        font-size: 19px;
+        font-weight: 700;
+        color: #ffffff;
+        letter-spacing: -0.02em;
+    }
+    .dialog-subtitle {
+        font-size: 13px;
+        color: #f5f5f5;
+        font-weight: 500;
+        line-height: 1.35;
+    }
+    .status-text {
+        font-size: 13px;
+        font-weight: 500;
+        color: #e4e4e7;
+    }
+    .step-text {
+        font-size: 12px;
+        font-weight: 400;
+        color: #71717a;
+    }
+    window.update-window button.notes-link,
+    button.notes-link,
+    .notes-link {
+        font-size: 12px;
+        color: #a1a1aa;
+        background: transparent;
+        background-color: transparent;
+        border: none;
+        box-shadow: none;
+        padding: 2px 8px;
+        min-height: 20px;
+        border-radius: 6px;
+        transition: all 150ms ease;
+    }
+    window.update-window button.notes-link:hover,
+    button.notes-link:hover,
+    .notes-link:hover {
+        color: #60A5FA;
+        background-color: rgba(255, 255, 255, 0.06);
+    }
+    window.update-window button.btn-primary,
+    window.update-window button.suggested-action,
+    button.btn-primary,
+    button.suggested-action,
+    .btn-primary {
+        background-color: #2563eb;
+        background-image: none;
+        color: #ffffff;
+        font-weight: 600;
+        font-size: 13px;
+        border-radius: 6px;
+        padding: 4px 16px;
+        min-height: 24px;
+        border: none;
+        box-shadow: none;
+        transition: all 150ms ease;
+    }
+    window.update-window button.btn-primary:hover,
+    window.update-window button.suggested-action:hover,
+    button.btn-primary:hover,
+    button.suggested-action:hover,
+    .btn-primary:hover {
+        background-color: #1d4ed8;
+        background-image: none;
+    }
+    window.update-window button.btn-primary:active,
+    window.update-window button.suggested-action:active,
+    button.btn-primary:active,
+    button.suggested-action:active,
+    .btn-primary:active {
+        background-color: #1e40af;
+        background-image: none;
+    }
+    window.update-window button.btn-secondary,
+    button.btn-secondary,
+    .btn-secondary {
+        background-color: #27272a;
+        background-image: none;
+        color: #f4f4f5;
+        font-weight: 500;
+        font-size: 13px;
+        border-radius: 6px;
+        padding: 4px 20px;
+        min-height: 24px;
+        border: 1px solid #3f3f46;
+        box-shadow: none;
+        transition: all 150ms ease;
+    }
+    window.update-window button.btn-secondary:hover,
+    button.btn-secondary:hover,
+    .btn-secondary:hover {
+        background-color: #323238;
+        background-image: none;
+        border-color: #52525b;
+    }
+    window.update-window button.btn-secondary:active,
+    button.btn-secondary:active,
+    .btn-secondary:active {
+        background-color: #1f1f23;
+        background-image: none;
+    }
+    window.update-window button.btn-secondary:disabled,
+    button.btn-secondary:disabled,
+    .btn-secondary:disabled {
+        opacity: 0.5;
+        color: #71717a;
+        border-color: #27272a;
+        background-color: #27272a;
+        background-image: none;
+    }
+    window.update-window button.details-toggle,
+    button.details-toggle,
+    .details-toggle {
+        font-size: 11px;
+        font-weight: 500;
+        color: #71717a;
+        background: transparent;
+        background-color: transparent;
+        border: none;
+        box-shadow: none;
+        padding: 0px;
+        transition: color 150ms ease;
+    }
+    window.update-window button.details-toggle:hover,
+    button.details-toggle:hover,
+    .details-toggle:hover {
+        color: #a1a1aa;
+    }
+    window.update-window button.details-toggle:focus,
+    button.details-toggle:focus,
+    .details-toggle:focus {
+        outline: none;
+        box-shadow: none;
+    }
+    .log-box,
+    .log-box viewport,
+    .log-box textview,
+    .log-box textview text {
+        background-color: #0d0d10;
+        color: #a1a1aa;
+        font-family: monospace;
+        font-size: 11px;
+    }
+    .log-box {
+        border: 1px solid #27272a;
+        border-radius: 2px;
+    }
+    .error-badge {
+        color: #71717a;
+        font-size: 13px;
+        font-weight: 500;
+        line-height: 1.35;
+    }
+    .success-badge-circle {
+        background-color: #22c55e;
+        color: #ffffff;
+        font-size: 11px;
+        font-weight: 800;
+        min-width: 18px;
+        min-height: 18px;
+        border-radius: 9999px;
+        border: none;
+        box-shadow: 0 0 18px rgba(34, 197, 94, 0.75);
+    }
+    .fail-badge-circle {
+        background-color: #ef4444;
+        color: #ffffff;
+        font-size: 9px;
+        font-weight: 800;
+        min-width: 14px;
+        min-height: 14px;
+        border-radius: 9999px;
+        border: none;
+        box-shadow: 0 0 12px rgba(239, 68, 68, 0.75);
+    }
+    .update-badge-circle {
+        background-color: #2563eb;
+        color: #ffffff;
+        font-size: 12px;
+        font-weight: 800;
+        min-width: 18px;
+        min-height: 18px;
+        border-radius: 9999px;
+        border: none;
+        box-shadow: 0 0 16px rgba(37, 99, 235, 0.75);
+    }
+    .version-pill {
+        background-color: rgba(255, 255, 255, 0.04);
+        border: 1px solid #3f3f46;
+        border-radius: 9999px;
+        padding: 5px 16px;
+        min-height: 24px;
+    }
+    .version-pill-current {
+        font-family: monospace;
+        font-size: 13px;
+        font-weight: 500;
+        color: #a1a1aa;
+    }
+    .version-pill-arrow {
+        font-size: 13px;
+        font-weight: 600;
+        color: #71717a;
+    }
+    .version-pill-new {
+        font-family: monospace;
+        font-size: 13px;
+        font-weight: 700;
+        color: #ffffff;
+    }
+    .log-copy-btn {
+        font-size: 10px;
+        font-weight: 500;
+        color: #a1a1aa;
+        background-color: rgba(39, 39, 42, 0.85);
+        border: 1px solid #3f3f46;
+        border-radius: 5px;
+        padding: 0px 2px;
+        min-height: 18px;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+        transition: all 150ms ease;
+    }
+    .log-copy-btn:hover {
+        color: #ffffff;
+        background-color: #323238;
+        border-color: #52525b;
+    }
+    .log-copy-btn:active {
+        background-color: #27272a;
+    }
+    .log-copy-btn.copied {
+        color: #ffffff;
+        border-color: #52525b;
+        background-color: #27272a;
+    }
+    """
+
+    def apply_styling():
+        provider = Gtk.CssProvider()
+        if hasattr(provider, "load_from_string"):
+            provider.load_from_string(custom_css.decode("utf-8"))
+        else:
+            provider.load_from_data(custom_css)
+        display = Gdk.Display.get_default()
+        if display:
+            Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+
+    def make_icon(size=56):
+        candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon.png"),
+            os.path.expanduser("~/.local/share/icons/hicolor/512x512/apps/open_design.png"),
+            os.path.expanduser("~/.local/share/icons/open_design.png"),
+        ]
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                try:
+                    texture = Gdk.Texture.new_from_filename(candidate)
+                    img = Gtk.Image.new_from_paintable(texture)
+                    img.set_pixel_size(size)
+                    img.set_size_request(size, size)
+                    img.set_halign(Gtk.Align.CENTER)
+                    img.set_valign(Gtk.Align.CENTER)
+                    return img
+                except Exception:
+                    pass
+        img = Gtk.Image.new_from_icon_name("open_design")
+        img.set_pixel_size(size)
+        img.set_size_request(size, size)
+        img.set_halign(Gtk.Align.CENTER)
+        img.set_valign(Gtk.Align.CENTER)
+        return img
+
+    def make_centered_hero_icon(badge_text=None, badge_class=None):
+        """Build a 52x52 hero icon container locked to identical geometry across all centered screens."""
+        icon_overlay = Gtk.Overlay()
+        icon_overlay.set_size_request(52, 52)
+        icon_overlay.set_halign(Gtk.Align.CENTER)
+        icon_overlay.set_valign(Gtk.Align.START)
+        base_icon = make_icon(52)
+        icon_overlay.set_child(base_icon)
+
+        if badge_text and badge_class:
+            badge = Gtk.Label(label=badge_text)
+            badge.set_size_request(18, 18)
+            badge.add_css_class(badge_class)
+            badge.set_halign(Gtk.Align.END)
+            badge.set_valign(Gtk.Align.END)
+            badge.set_margin_end(-2)
+            badge.set_margin_bottom(-2)
+            icon_overlay.add_overlay(badge)
+
+        return icon_overlay
+
+    class ShimmerProgressBar(Gtk.DrawingArea):
+        """
+        Custom hardware-synchronized progress bar with a soft specular highlight sheen
+        traveling left-to-right across the active progress and smooth easing.
+        """
+        def __init__(self):
+            super().__init__()
+            self.set_content_height(4)
+            self.set_hexpand(True)
+            self.current_fraction = 0.05
+            self.target_fraction = 0.05
+            self.shimmer_offset = 0.0
+            self._stopped = False
+            self.set_draw_func(self.draw)
+            self.add_tick_callback(self.on_tick)
+
+        def set_fraction(self, frac):
+            self.target_fraction = max(0.0, min(1.0, frac))
+            self.queue_draw()
+
+        def stop(self):
+            """Stop the frame-clock tick callback to avoid unnecessary GPU wakeups."""
+            self._stopped = True
+
+        def on_tick(self, widget, frame_clock):
+            if self._stopped:
+                return False
+            if not self.get_visible() or not self.get_mapped():
+                return True
+
+            # 1. Smooth interpolation toward target fraction
+            diff = self.target_fraction - self.current_fraction
+            if abs(diff) > 0.0005:
+                self.current_fraction += diff * 0.10
+
+            # 2. Specular sheen traveling sweep across completed portion
+            self.shimmer_offset += 0.016
+            if self.shimmer_offset > 1.4:
+                self.shimmer_offset = -0.4
+
+            self.queue_draw()
+            return True
+
+        def draw(self, area, cr, width, height):
+            r = height / 2.0
+
+            # Background trough (#27272a)
+            cr.arc(r, r, r, math.pi / 2, 3 * math.pi / 2)
+            cr.arc(width - r, r, r, -math.pi / 2, math.pi / 2)
+            cr.close_path()
+            cr.set_source_rgb(0.153, 0.153, 0.165)  # #27272a
+            cr.fill()
+
+            # Active progress portion
+            frac = max(0.01, min(1.0, self.current_fraction))
+            prog_w = max(height, width * frac)
+
+            cr.save()
+            cr.arc(r, r, r, math.pi / 2, 3 * math.pi / 2)
+            cr.arc(prog_w - r, r, r, -math.pi / 2, math.pi / 2)
+            cr.close_path()
+            cr.clip()
+
+            # Premium blue gradient (#2563eb to #3b82f6)
+            pat = cairo.LinearGradient(0, 0, prog_w, 0)
+            pat.add_color_stop_rgb(0.0, 0.145, 0.388, 0.921)  # #2563eb
+            pat.add_color_stop_rgb(1.0, 0.231, 0.510, 0.965)  # #3b82f6
+            cr.set_source(pat)
+            cr.paint()
+
+            # Specular light highlight sweeping across completed progress
+            shimmer_x = prog_w * self.shimmer_offset
+            shimmer_w = min(80.0, max(24.0, prog_w * 0.5))
+            spat = cairo.LinearGradient(shimmer_x - shimmer_w, 0, shimmer_x + shimmer_w, 0)
+            spat.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.0)
+            spat.add_color_stop_rgba(0.5, 1.0, 1.0, 1.0, 0.35)
+            spat.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.0)
+            cr.set_source(spat)
+            cr.paint()
+
+            cr.restore()
+
+    def open_release_notes(_btn, tag=None):
+        if shutil.which("xdg-open"):
+            target_url = DEFAULT_REPO_URL
+            if tag and isinstance(tag, str):
+                clean_t = tag.strip()
+                if re.match(r"^open-design-v\d+\.\d+\.\d+", clean_t):
+                    target_url = f"{DEFAULT_REPO_URL}/tag/{clean_t}"
+                elif re.match(r"^v?\d+\.\d+\.\d+$", clean_t):
+                    target_url = f"{DEFAULT_REPO_URL}/tag/open-design-v{clean_t.lstrip('v')}"
+            try:
+                subprocess.Popen(
+                    ["xdg-open", target_url],
+                    start_new_session=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                pass
+
+    def on_activate(application):
+        apply_styling()
+        win = Adw.Window(application=application)
+        win.set_title("Open Design Updates")
+        win.set_default_size(410, 293)
+        win.set_resizable(False)
+        win.add_css_class("update-window")
+
+        active_update_cancel = {"fn": None}
+
+        def on_close_request(_window):
+            if active_update_cancel["fn"] is not None:
+                active_update_cancel["fn"](close_after=True)
+                return True
+            return False
+
+        win.connect("close-request", on_close_request)
+
+        # Support Esc to close when not actively running an update build
+        if hasattr(Gtk, "EventControllerKey"):
+            key_ctrl = Gtk.EventControllerKey()
+
+            def on_key_pressed(_ctrl, keyval, _keycode, _state):
+                esc_key = getattr(Gdk, "KEY_Escape", 0xFF1B)
+                if keyval == esc_key and active_update_cancel["fn"] is None:
+                    win.close()
+                    return True
+                return False
+
+            key_ctrl.connect("key-pressed", on_key_pressed)
+            win.add_controller(key_ctrl)
+
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        main_box.set_size_request(410, 293)
+        header = Adw.HeaderBar()
+        header.add_css_class("headerbar")
+        header.set_show_title(False)
+        main_box.append(header)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        body.set_vexpand(True)
+        body.set_margin_start(22)
+        body.set_margin_end(22)
+        body.set_margin_bottom(12)
+        body.set_margin_top(0)
+
+        content_area = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        content_area.set_vexpand(True)
+        body.append(content_area)
+
+        action_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        action_bar.set_halign(Gtk.Align.END)
+        action_bar.set_valign(Gtk.Align.END)
+        action_bar.set_margin_top(4)
+        body.append(action_bar)
+
+        main_box.append(body)
+        win.set_content(main_box)
+        win.present()
+
+        # Constant top offset for all centered-logo screens so the 52x52 logo and title never shift
+        CENTERED_HERO_TOP_MARGIN = 10
+        CENTERED_TITLE_TOP_MARGIN = 12
+
+        def clear_content():
+            if hasattr(win, "set_default_widget"):
+                win.set_default_widget(None)
+            while True:
+                c = content_area.get_first_child()
+                if not c:
+                    break
+                content_area.remove(c)
+            while True:
+                c = action_bar.get_first_child()
+                if not c:
+                    break
+                action_bar.remove(c)
+
+        def _prepare_centered_stage(badge_text=None, badge_class=None):
+            """Configure content_area so the 52x52 centered logo sits at the exact same (X, Y) position."""
+            clear_content()
+            content_area.set_valign(Gtk.Align.START)
+            content_area.set_margin_top(CENTERED_HERO_TOP_MARGIN)
+            content_area.set_margin_bottom(0)
+            content_area.append(make_centered_hero_icon(badge_text, badge_class))
+
+        def show_checking():
+            _prepare_centered_stage()
+
+            tbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            tbox.set_halign(Gtk.Align.CENTER)
+            tbox.set_margin_top(CENTERED_TITLE_TOP_MARGIN)
+            title = Gtk.Label(label="Checking for Updates")
+            title.add_css_class("dialog-title")
+            tbox.append(title)
+
+            subtitle = Gtk.Label(label="Connecting to Open Design repository...")
+            subtitle.add_css_class("dialog-subtitle")
+            tbox.append(subtitle)
+            content_area.append(tbox)
+
+            spinner = Gtk.Spinner()
+            spinner.set_size_request(26, 26)
+            spinner.set_halign(Gtk.Align.CENTER)
+            spinner.set_margin_top(12)
+            content_area.append(spinner)
+            GLib.idle_add(spinner.start)
+
+            cbtn = Gtk.Button(label="Cancel")
+            cbtn.add_css_class("btn-secondary")
+            cbtn.connect("clicked", lambda b: win.close())
+            action_bar.append(cbtn)
+
+        def show_uptodate(version_tag):
+            if not win.get_visible():
+                return False
+            _prepare_centered_stage()
+
+            clean_ver = clean_ver_str(version_tag)
+            tbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            tbox.set_halign(Gtk.Align.CENTER)
+            tbox.set_margin_top(CENTERED_TITLE_TOP_MARGIN)
+            title = Gtk.Label(label="Open Design is Up to Date")
+            title.add_css_class("dialog-title")
+            tbox.append(title)
+
+            subtitle = Gtk.Label(label=f"You are running the latest version ({clean_ver}).")
+            subtitle.add_css_class("dialog-subtitle")
+            tbox.append(subtitle)
+            content_area.append(tbox)
+
+            nbtn = Gtk.Button(label="View release notes on GitHub ↗")
+            nbtn.add_css_class("notes-link")
+            nbtn.set_halign(Gtk.Align.CENTER)
+            nbtn.set_margin_top(10)
+            nbtn.connect("clicked", lambda b: open_release_notes(b, version_tag))
+            content_area.append(nbtn)
+
+            close_btn = Gtk.Button(label="Close")
+            close_btn.add_css_class("btn-secondary")
+            close_btn.connect("clicked", lambda b: win.close())
+            action_bar.append(close_btn)
+            if hasattr(win, "set_default_widget"):
+                win.set_default_widget(close_btn)
+            return False
+
+        def retry_check(_btn=None):
+            show_checking()
+            threading.Thread(target=check_tags, daemon=True).start()
+
+        def show_error(msg):
+            if not win.get_visible():
+                return False
+            _prepare_centered_stage()
+
+            tbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            tbox.set_halign(Gtk.Align.CENTER)
+            tbox.set_margin_top(CENTERED_TITLE_TOP_MARGIN)
+            title = Gtk.Label(label="Unable to Check for Updates")
+            title.add_css_class("dialog-title")
+            tbox.append(title)
+
+            subtitle = Gtk.Label(label=msg)
+            subtitle.add_css_class("dialog-subtitle")
+            subtitle.set_wrap(True)
+            subtitle.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            subtitle.set_max_width_chars(30)
+            if hasattr(Gtk, "Justification"):
+                subtitle.set_justify(Gtk.Justification.CENTER)
+            subtitle.set_halign(Gtk.Align.CENTER)
+            tbox.append(subtitle)
+            content_area.append(tbox)
+
+            close_btn = Gtk.Button(label="Close")
+            close_btn.add_css_class("btn-secondary")
+            close_btn.connect("clicked", lambda b: win.close())
+            action_bar.append(close_btn)
+
+            retry_btn = Gtk.Button(label="Try Again")
+            retry_btn.add_css_class("btn-primary")
+            retry_btn.add_css_class("suggested-action")
+            retry_btn.connect("clicked", retry_check)
+            action_bar.append(retry_btn)
+            if hasattr(win, "set_default_widget"):
+                win.set_default_widget(retry_btn)
+            return False
+
+        def show_prompt(cur_v, lat_v, orig_ref=None):
+            if not win.get_visible():
+                return False
+            _prepare_centered_stage("↑", "update-badge-circle")
+
+            clean_cur = clean_ver_str(cur_v)
+            clean_lat = clean_ver_str(lat_v)
+
+            tbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            tbox.set_halign(Gtk.Align.CENTER)
+            tbox.set_margin_top(CENTERED_TITLE_TOP_MARGIN)
+            title = Gtk.Label(label="Update Available")
+            title.add_css_class("dialog-title")
+            tbox.append(title)
+
+            subtitle = Gtk.Label(label="A new release of Open Design is ready to install.")
+            subtitle.add_css_class("dialog-subtitle")
+            tbox.append(subtitle)
+            content_area.append(tbox)
+
+            # Compact pill for version comparison
+            version_pill = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            version_pill.set_halign(Gtk.Align.CENTER)
+            version_pill.set_margin_top(8)
+            version_pill.add_css_class("version-pill")
+
+            cur_val = Gtk.Label(label=clean_cur)
+            cur_val.add_css_class("version-pill-current")
+            version_pill.append(cur_val)
+
+            arrow = Gtk.Label(label="→")
+            arrow.add_css_class("version-pill-arrow")
+            version_pill.append(arrow)
+
+            new_val = Gtk.Label(label=clean_lat)
+            new_val.add_css_class("version-pill-new")
+            version_pill.append(new_val)
+
+            content_area.append(version_pill)
+
+            nbtn = Gtk.Button(label="View full release notes on GitHub ↗")
+            nbtn.add_css_class("notes-link")
+            nbtn.set_halign(Gtk.Align.CENTER)
+            nbtn.set_margin_top(4)
+            nbtn.connect("clicked", lambda b: open_release_notes(b, lat_v))
+            content_area.append(nbtn)
+
+            lbtn = Gtk.Button(label="Later")
+            lbtn.add_css_class("btn-secondary")
+            lbtn.connect("clicked", lambda b: win.close())
+            action_bar.append(lbtn)
+
+            ubtn = Gtk.Button(label="Update Now")
+            ubtn.add_css_class("btn-primary")
+            ubtn.add_css_class("suggested-action")
+            ubtn.connect("clicked", lambda b: start_updating(lat_v, orig_ref=orig_ref))
+            action_bar.append(ubtn)
+            if hasattr(win, "set_default_widget"):
+                win.set_default_widget(ubtn)
+            return False
+
+        def start_updating(lat_v, orig_ref=None):
+            clear_content()
+            clean_lat = clean_ver_str(lat_v)
+
+            content_area.set_valign(Gtk.Align.START)
+            content_area.set_margin_top(0)
+            content_area.set_margin_bottom(0)
+
+            top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            top_row.set_size_request(-1, 40)
+            top_row.set_valign(Gtk.Align.START)
+
+            icon_overlay = Gtk.Overlay()
+            icon_overlay.set_size_request(40, 40)
+            icon_overlay.set_halign(Gtk.Align.START)
+            icon_overlay.set_valign(Gtk.Align.CENTER)
+            base_icon = make_icon(40)
+            icon_overlay.set_child(base_icon)
+
+            fail_badge = Gtk.Label(label="✖")
+            fail_badge.set_size_request(14, 14)
+            fail_badge.add_css_class("fail-badge-circle")
+            fail_badge.set_halign(Gtk.Align.END)
+            fail_badge.set_valign(Gtk.Align.END)
+            fail_badge.set_margin_end(-2)
+            fail_badge.set_margin_bottom(-2)
+            fail_badge.set_visible(False)
+            icon_overlay.add_overlay(fail_badge)
+            top_row.append(icon_overlay)
+
+            tbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            tbox.set_valign(Gtk.Align.CENTER)
+            title = Gtk.Label(xalign=0)
+            title.add_css_class("dialog-title")
+            title.set_markup("<b>Updating Open Design</b>")
+            subtitle = Gtk.Label(label=f"Installing {clean_lat}...", xalign=0)
+            subtitle.add_css_class("dialog-subtitle")
+            tbox.append(title)
+            tbox.append(subtitle)
+            top_row.append(tbox)
+            content_area.append(top_row)
+
+            prog_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            prog_box.set_margin_top(6)
+
+            status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            slbl = Gtk.Label(label="Preparing update...", xalign=0)
+            slbl.add_css_class("status-text")
+            slbl.set_hexpand(True)
+            status_row.append(slbl)
+
+            step_lbl = Gtk.Label(label="Step 1 of 5", xalign=1)
+            step_lbl.add_css_class("step-text")
+            status_row.append(step_lbl)
+            prog_box.append(status_row)
+
+            pbar = ShimmerProgressBar()
+            pbar.set_fraction(0.05)
+            prog_box.append(pbar)
+            content_area.append(prog_box)
+
+            details_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            details_header.set_margin_top(2)
+            details_header.set_margin_bottom(2)
+
+            toggle_btn = Gtk.Button()
+            toggle_btn.add_css_class("details-toggle")
+            toggle_btn.set_halign(Gtk.Align.START)
+            toggle_btn.set_valign(Gtk.Align.CENTER)
+
+            toggle_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            arrow_lbl = Gtk.Label(label="▶")
+            text_lbl = Gtk.Label(label="View Details")
+            toggle_box.append(arrow_lbl)
+            toggle_box.append(text_lbl)
+            toggle_btn.set_child(toggle_box)
+            details_header.append(toggle_btn)
+
+            copy_btn = Gtk.Button(label="Copy")
+            copy_btn.add_css_class("log-copy-btn")
+            copy_btn.set_halign(Gtk.Align.END)
+            copy_btn.set_valign(Gtk.Align.CENTER)
+            copy_btn.set_hexpand(True)
+            copy_btn.set_visible(False)
+            details_header.append(copy_btn)
+
+            content_area.append(details_header)
+
+            scrolled = Gtk.ScrolledWindow()
+            scrolled.set_vexpand(True)
+            scrolled.add_css_class("log-box")
+            scrolled.set_visible(False)
+
+            log_view = Gtk.TextView()
+            log_view.set_editable(False)
+            log_view.set_cursor_visible(False)
+            log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            log_view.set_monospace(True)
+            log_view.set_top_margin(4)
+            log_view.set_bottom_margin(4)
+            log_view.set_left_margin(10)
+            log_view.set_right_margin(10)
+            log_buf = log_view.get_buffer()
+            scrolled.set_child(log_view)
+            content_area.append(scrolled)
+
+            def on_copy_clicked(b):
+                start_i = log_buf.get_start_iter()
+                end_i = log_buf.get_end_iter()
+                txt = log_buf.get_text(start_i, end_i, False)
+                if txt:
+                    disp = Gdk.Display.get_default()
+                    if disp:
+                        disp.get_clipboard().set(txt)
+                copy_btn.set_label("Copied ✓")
+                copy_btn.add_css_class("copied")
+
+                def reset_lbl():
+                    if win.get_visible():
+                        copy_btn.set_label("Copy")
+                        copy_btn.remove_css_class("copied")
+                    return False
+
+                GLib.timeout_add(1500, reset_lbl)
+
+            copy_btn.connect("clicked", on_copy_clicked)
+
+            def set_details_expanded(expanded):
+                scrolled.set_visible(expanded)
+                copy_btn.set_visible(expanded)
+                arrow_lbl.set_label("▼" if expanded else "▶")
+                content_area.set_valign(Gtk.Align.FILL if expanded else Gtk.Align.START)
+
+            toggle_btn.connect("clicked", lambda b: set_details_expanded(not scrolled.get_visible()))
+
+            cbtn = Gtk.Button(label="Cancel")
+            cbtn.add_css_class("btn-secondary")
+
+            updating_state = {"canceled": False, "close_after": False, "proc": None}
+
+            stamp_path = os.path.expanduser("~/.config/open-design/build-stamp")
+
+            def rollback_to_original():
+                try:
+                    os.makedirs(os.path.dirname(stamp_path), mode=0o700, exist_ok=True)
+                    with open(stamp_path, "w", encoding="utf-8") as sf:
+                        sf.write(f"pending:{orig_ref or 'rollback'}\n")
+                except OSError:
+                    pass
+                if orig_ref:
+                    try:
+                        subprocess.run(
+                            ["git", "checkout", "-f", orig_ref, "--quiet"],
+                            cwd=cfg["repo"],
+                            capture_output=True,
+                            timeout=15,
+                        )
+                    except Exception:
+                        pass
+
+            def trigger_cancel(close_after=False):
+                updating_state["canceled"] = True
+                if close_after:
+                    updating_state["close_after"] = True
+                cbtn.set_sensitive(False)
+                _terminate_proc_group(updating_state["proc"])
+
+            active_update_cancel["fn"] = trigger_cancel
+
+            def on_cancel_clicked(b):
+                if cbtn.get_label() == "Close":
+                    win.close()
+                    return
+                trigger_cancel(close_after=False)
+
+            cbtn.connect("clicked", on_cancel_clicked)
+            action_bar.append(cbtn)
+
+            def append_log(text):
+                if not win.get_visible():
+                    return False
+                cleaned = text.strip()
+                if cleaned:
+                    if "\r" in cleaned:
+                        cleaned = cleaned.split("\r")[-1].strip()
+                    if cleaned:
+                        log_buf.insert(log_buf.get_end_iter(), f"> {cleaned}\n")
+                        log_view.scroll_to_iter(log_buf.get_end_iter(), 0.0, False, 0.0, 0.0)
+                return False
+
+            def update_ui(pct, msg, step_txt):
+                if not win.get_visible():
+                    return False
+                pbar.set_fraction(pct)
+                slbl.set_text(msg)
+                step_lbl.set_text(step_txt)
+                return False
+
+            def on_done():
+                active_update_cancel["fn"] = None
+                pbar.stop()
+                if not win.get_visible():
+                    return False
+                _prepare_centered_stage("✓", "success-badge-circle")
+
+                tbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+                tbox.set_halign(Gtk.Align.CENTER)
+                tbox.set_margin_top(CENTERED_TITLE_TOP_MARGIN)
+                t = Gtk.Label(label="Update Complete")
+                t.add_css_class("dialog-title")
+                tbox.append(t)
+
+                s = Gtk.Label(label=f"Open Design is now updated to {clean_lat}.")
+                s.add_css_class("dialog-subtitle")
+                tbox.append(s)
+                content_area.append(tbox)
+
+                nbtn = Gtk.Button(label="View release notes on GitHub ↗")
+                nbtn.add_css_class("notes-link")
+                nbtn.set_halign(Gtk.Align.CENTER)
+                nbtn.set_margin_top(10)
+                nbtn.connect("clicked", lambda b: open_release_notes(b, lat_v))
+                content_area.append(nbtn)
+
+                close_btn = Gtk.Button(label="Close")
+                close_btn.add_css_class("btn-secondary")
+                close_btn.connect("clicked", lambda b: win.close())
+                action_bar.append(close_btn)
+
+                launch_btn = Gtk.Button(label="Launch")
+                launch_btn.add_css_class("btn-primary")
+                launch_btn.add_css_class("suggested-action")
+
+                def on_launch(b):
+                    result["action"] = "launch"
+                    win.close()
+
+                launch_btn.connect("clicked", on_launch)
+                action_bar.append(launch_btn)
+                if hasattr(win, "set_default_widget"):
+                    win.set_default_widget(launch_btn)
+                return False
+
+            def on_fail(step_name):
+                active_update_cancel["fn"] = None
+                pbar.stop()
+                if not win.get_visible():
+                    return False
+                if updating_state["close_after"]:
+                    win.close()
+                    return False
+                if step_name == "cancelled by user":
+                    title.set_markup("<b>Update Cancelled</b>")
+                    subtitle.set_text("Update cancelled by user.")
+                else:
+                    title.set_markup("<b>Update Failed</b>")
+                    subtitle.set_text(f"An error occurred during {step_name}.")
+                subtitle.add_css_class("error-badge")
+                fail_badge.set_visible(True)
+                prog_box.set_visible(False)
+                details_header.set_margin_top(6)
+                cbtn.set_label("Close")
+                cbtn.set_sensitive(True)
+                if hasattr(win, "set_default_widget"):
+                    win.set_default_widget(cbtn)
+                set_details_expanded(True)
+                return False
+
+            def run_step(cmd, pct, status_msg, step_txt, fail_label, env=None, mutates_build=True):
+                """Run a single update step; return True on success, False on failure or cancel."""
+                if updating_state["canceled"]:
+                    return False
+                GLib.idle_add(update_ui, pct, status_msg, step_txt)
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        cwd=cfg["repo"],
+                        env=env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        start_new_session=True,
+                    )
+                except OSError as e:
+                    GLib.idle_add(append_log, f"Failed to execute {cmd[0]}: {e}")
+                    if mutates_build:
+                        rollback_to_original()
+                    GLib.idle_add(on_fail, fail_label)
+                    return False
+                updating_state["proc"] = proc
+                if proc.stdout:
+                    for line in proc.stdout:
+                        GLib.idle_add(append_log, line)
+                rc = proc.wait()
+                updating_state["proc"] = None
+                if updating_state["canceled"]:
+                    return False
+                if rc != 0:
+                    if mutates_build:
+                        rollback_to_original()
+                    GLib.idle_add(on_fail, fail_label)
+                    return False
+                return True
+
+            def worker():
+                active_lock_file, active_lock_path = get_active_update_lock()
+                if active_lock_file is None:
+                    GLib.idle_add(on_fail, "concurrent update lock")
+                    return
+                try:
+                    legacy_stamp = os.path.join(cfg["repo"], ".open-design-build-stamp")
+                    if os.path.exists(legacy_stamp):
+                        os.unlink(legacy_stamp)
+                except OSError:
+                    pass
+                try:
+                    build_env = os.environ.copy()
+                    build_env["NODE_OPTIONS"] = "--max-old-space-size=4096"
+                    raw_ver = clean_lat.lstrip("v")
+                    if raw_ver and raw_ver != "unknown":
+                        build_env["OD_APP_VERSION"] = raw_ver
+                        build_env["OD_RELEASE_CHANNEL"] = "stable"
+                    build_env["OD_WEB_OUTPUT_MODE"] = "server"
+                    build_env.setdefault("ONNXRUNTIME_NODE_INSTALL_CUDA", "skip")
+                    build_env.setdefault("ELECTRON_SKIP_BINARY_DOWNLOAD", "1")
+                    git_env = os.environ.copy()
+                    git_env["GIT_TERMINAL_PROMPT"] = "0"
+
+                    # Guard against overwriting uncommitted or untracked local files in the repository
+                    try:
+                        st_res = subprocess.run(
+                            ["git", "status", "--porcelain"],
+                            cwd=cfg["repo"],
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                        )
+                        if st_res.returncode == 0 and st_res.stdout.strip():
+                            GLib.idle_add(
+                                append_log,
+                                f"Uncommitted or untracked local files detected in {cfg['repo']}. Please commit, stash, or remove them before updating.",
+                            )
+                            GLib.idle_add(on_fail, "local changes check")
+                            return
+                    except Exception:
+                        pass
+
+                    if updating_state["canceled"]:
+                        GLib.idle_add(on_fail, "cancelled by user")
+                        return
+
+                    GLib.idle_add(update_ui, 0.15, "Stopping background services...", "Step 1 of 5")
+                    stop_services(cfg)
+                    if (
+                        get_repo_pids(cfg["repo"])
+                        or get_pwa_browser_pids(cfg["pwa_dir"])
+                        or is_server_running(cfg["host"], cfg["port"])
+                    ):
+                        GLib.idle_add(
+                            append_log,
+                            f"Could not stop running Open Design services or free port {cfg['port']}.",
+                        )
+                        GLib.idle_add(on_fail, "stopping services")
+                        return
+
+                    if updating_state["canceled"]:
+                        GLib.idle_add(on_fail, "cancelled by user")
+                        return
+
+                    # Ensure target tag objects are fetched locally before marking build-stamp as pending,
+                    # so a network failure or cancel during git fetch leaves the existing build runnable.
+                    local_tag_check = subprocess.run(
+                        ["git", "rev-parse", "-q", "--verify", f"refs/tags/{lat_v}"],
+                        cwd=cfg["repo"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if local_tag_check.returncode != 0:
+                        if not run_step(
+                            ["git", "fetch", "--depth=1", "origin", f"refs/tags/{lat_v}:refs/tags/{lat_v}", "--force", "-q"],
+                            0.28,
+                            f"Downloading {clean_lat}...",
+                            "Step 2 of 5",
+                            "git fetch",
+                            env=git_env,
+                            mutates_build=False,
+                        ):
+                            if updating_state["canceled"]:
+                                GLib.idle_add(on_fail, "cancelled by user")
+                            return
+
+                    if updating_state["canceled"]:
+                        GLib.idle_add(on_fail, "cancelled by user")
+                        return
+
+                    try:
+                        os.makedirs(os.path.dirname(stamp_path), mode=0o700, exist_ok=True)
+                        with open(stamp_path, "w", encoding="utf-8") as sf:
+                            sf.write(f"pending:{lat_v}\n")
+                    except OSError:
+                        pass
+
+                    steps = [
+                        (
+                            ["git", "checkout", "-f", lat_v, "--quiet"],
+                            0.35,
+                            f"Checking out {clean_lat}...",
+                            "Step 2 of 5",
+                            "git checkout",
+                            git_env,
+                        ),
+                        (
+                            ["pnpm", "install", "--config.engine-strict=false", "--frozen-lockfile", "--prefer-offline"],
+                            0.60,
+                            "Installing dependencies...",
+                            "Step 3 of 5",
+                            "dependency installation",
+                            build_env,
+                        ),
+                        (
+                            ["pnpm", "--filter", "@open-design/daemon", "build"],
+                            0.75,
+                            "Building daemon service...",
+                            "Step 4 of 5",
+                            "daemon build",
+                            build_env,
+                        ),
+                        (
+                            ["pnpm", "--filter", "@open-design/web", "build"],
+                            0.90,
+                            "Building web interface...",
+                            "Step 5 of 5",
+                            "web build",
+                            build_env,
+                        ),
+                    ]
+
+                    for cmd, pct, status_msg, step_txt, fail_label, step_env in steps:
+                        if not run_step(cmd, pct, status_msg, step_txt, fail_label, env=step_env):
+                            if updating_state["canceled"]:
+                                rollback_to_original()
+                                GLib.idle_add(on_fail, "cancelled by user")
+                            return
+
+                    if updating_state["canceled"]:
+                        rollback_to_original()
+                        GLib.idle_add(on_fail, "cancelled by user")
+                    else:
+                        try:
+                            with open(stamp_path, "w", encoding="utf-8") as sf:
+                                sf.write(f"{lat_v}\n")
+                        except OSError:
+                            pass
+                        GLib.idle_add(on_done)
+                except Exception as exc:
+                    rollback_to_original()
+                    GLib.idle_add(append_log, f"Unexpected error: {exc}")
+                    GLib.idle_add(on_fail, "update process")
+                finally:
+                    release_update_lock(active_lock_file, active_lock_path)
+
+            wt = threading.Thread(target=worker, daemon=False)
+            result["worker_thread"] = wt
+            wt.start()
+
+        def check_tags():
+            git_env = os.environ.copy()
+            git_env["GIT_TERMINAL_PROMPT"] = "0"
+
+            # Query remote release tags via lightweight ls-remote (<2 KB transfer, no packfile download)
+            # with automatic retry and fallback to git fetch --tags
+            all_tags = []
+            last_err_timeout = False
+
+            for attempt in range(2):
+                try:
+                    ls_res = subprocess.run(
+                        ["git", "ls-remote", "--tags", "--refs", "origin", "refs/tags/open-design-v*"],
+                        cwd=cfg["repo"],
+                        env=git_env,
+                        timeout=20,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if ls_res.returncode == 0:
+                        for line in ls_res.stdout.splitlines():
+                            if "refs/tags/" in line:
+                                t = line.split("refs/tags/", 1)[-1].strip()
+                                if t.startswith("open-design-v"):
+                                    all_tags.append(t)
+                        break
+                    last_err_timeout = False
+                except subprocess.TimeoutExpired:
+                    last_err_timeout = True
+                except Exception:
+                    last_err_timeout = False
+                if attempt == 0:
+                    time.sleep(0.5)
+
+            if not all_tags:
+                try:
+                    res = subprocess.run(
+                        ["git", "fetch", "--tags", "--force", "-q"],
+                        cwd=cfg["repo"],
+                        env=git_env,
+                        timeout=25,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if res.returncode != 0:
+                        GLib.idle_add(
+                            show_error,
+                            "Make sure you're connected to the internet,\nthen try again.",
+                        )
+                        return
+                except subprocess.TimeoutExpired:
+                    GLib.idle_add(
+                        show_error,
+                        "The connection to GitHub timed out.\nPlease try again in a moment.",
+                    )
+                    return
+                except Exception:
+                    GLib.idle_add(
+                        show_error,
+                        "Make sure you're connected to the internet,\nthen try again.",
+                    )
+                    return
+
+                tags_res = subprocess.run(
+                    ["git", "tag", "-l", "open-design-v*"],
+                    cwd=cfg["repo"],
+                    capture_output=True,
+                    text=True,
+                )
+                all_tags = [t.strip() for t in tags_res.stdout.splitlines() if t.strip()]
+
+            if not all_tags:
+                if last_err_timeout:
+                    GLib.idle_add(
+                        show_error,
+                        "The connection to GitHub timed out.\nPlease try again in a moment.",
+                    )
+                else:
+                    GLib.idle_add(
+                        show_error,
+                        "No release tags were found\nin the upstream repository.",
+                    )
+                return
+
+            # Prefer strict semver stable tags; verify against published GitHub Releases when reachable
+            tags = [t for t in all_tags if re.match(r"^open-design-v\d+\.\d+\.\d+$", t)]
+
+            api_override = os.environ.get("OPEN_DESIGN_RELEASES_API", "").strip()
+            origin_url = ""
+            try:
+                orig_res = subprocess.run(
+                    ["git", "remote", "get-url", "origin"],
+                    cwd=cfg["repo"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                origin_url = orig_res.stdout.strip()
+            except Exception:
+                pass
+
+            if api_override or "nexu-io/open-design" in origin_url:
+                rel_url = api_override or "https://api.github.com/repos/nexu-io/open-design/releases?per_page=30"
+                try:
+                    req = urllib.request.Request(
+                        rel_url,
+                        headers={"Accept": "application/vnd.github+json", "User-Agent": "open-design-desktop-linux"},
+                    )
+                    with urllib.request.urlopen(req, timeout=6) as resp:
+                        rel_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    if isinstance(rel_data, dict):
+                        rel_data = [rel_data]
+                    published = {
+                        r.get("tag_name", "").strip()
+                        for r in rel_data
+                        if isinstance(r, dict) and not r.get("draft") and not r.get("prerelease") and r.get("tag_name")
+                    }
+                    verified_tags = [t for t in tags if t in published]
+                    if verified_tags or api_override:
+                        tags = verified_tags
+                except Exception:
+                    if api_override:
+                        tags = []
+
+            if not tags:
+                GLib.idle_add(
+                    show_error,
+                    "No published stable releases were found\nin the upstream repository.",
+                )
+                return
+
+            tags.sort(key=parse_ver)
+            latest_tag = tags[-1]
+
+            cur_res = subprocess.run(
+                ["git", "describe", "--tags", "--exact-match", "--match", "open-design-v*"],
+                cwd=cfg["repo"],
+                capture_output=True,
+                text=True,
+            )
+            current_tag = cur_res.stdout.strip() if cur_res.returncode == 0 else ""
+
+            cur_ver = get_installed_version(cfg["repo"], current_tag=current_tag)
+            orig_ref = get_current_git_ref(cfg["repo"]) or current_tag
+
+            has_pending_build = False
+            stamp_check_path = os.path.expanduser("~/.config/open-design/build-stamp")
+            if os.path.isfile(stamp_check_path):
+                try:
+                    with open(stamp_check_path, "r", encoding="utf-8", errors="ignore") as scf:
+                        has_pending_build = scf.read().strip().startswith("pending:")
+                except OSError:
+                    pass
+
+            is_latest = (not has_pending_build) and (
+                (current_tag == latest_tag)
+                or (cur_ver != "unknown" and parse_ver(cur_ver) >= parse_ver(latest_tag))
+            )
+            if is_latest:
+                GLib.idle_add(show_uptodate, latest_tag)
+            else:
+                GLib.idle_add(show_prompt, clean_ver_str(cur_ver), latest_tag, orig_ref)
+
+        show_checking()
+        threading.Thread(target=check_tags, daemon=True).start()
+
+    app.connect("activate", on_activate)
+    app.run([])
+
+    if result["worker_thread"] is not None and result["worker_thread"].is_alive():
+        result["worker_thread"].join(timeout=5.0)
+
+    release_update_lock(lock_file, lock_path)
+
+    if result["action"] == "launch":
+        cmd_start()
+
+
+def main():
+    raw_args = sys.argv[1:]
+    args = [a for a in raw_args if a not in ("-q", "--quiet")]
+    quiet = len(args) != len(raw_args)
+    if len(args) > 1:
+        print(f"Error: Unexpected argument '{args[1]}'.", file=sys.stderr)
+        print("Usage: open-design [--stop | --update | --version | --help]", file=sys.stderr)
+        sys.exit(2)
+    action = args[0] if args else "start"
+    if quiet and action not in ("--stop", "stop", "--start", "start"):
+        print(f"Error: '--quiet' cannot be combined with '{action}'.", file=sys.stderr)
+        print("Usage: open-design [--stop | --update | --version | --help]", file=sys.stderr)
+        sys.exit(2)
+    if action in ("--start", "start"):
+        cmd_start()
+    elif action in ("--stop", "stop"):
+        cmd_stop(quiet=quiet)
+    elif action in ("--update", "update"):
+        cmd_update()
+    elif action in ("--version", "-v"):
+        cfg = load_config()
+        print(f"Open Design Desktop ({clean_ver_str(get_installed_version(cfg['repo']))})")
+    elif action in ("--help", "-h"):
+        print("Open Design Desktop")
+        print("Usage: open-design [--stop | --update | --version | --help]")
+    else:
+        print(f"Error: Unknown option '{action}'.", file=sys.stderr)
+        print("Usage: open-design [--stop | --update | --version | --help]", file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

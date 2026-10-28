@@ -1,0 +1,20 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Open Design
+GenericName=AI Design Workspace
+Comment=Local-first collaborative AI design agent workspace
+Icon=@ICON_PATH@
+Exec=@EXEC_PATH@
+Terminal=false
+Categories=Graphics;2DGraphics;
+StartupWMClass=@STARTUP_WM_CLASS@
+Actions=Stop;Update;
+
+[Desktop Action Stop]
+Name=Stop Server
+Exec=@EXEC_PATH@ --stop
+
+[Desktop Action Update]
+Name=Check for Updates
+Exec=@EXEC_PATH@ --update

@@ -1,0 +1,10 @@
+# Runtime and temporary files
+*.pyc
+__pycache__/
+*.log
+*.tmp
+*.bak
+.DS_Store
+
+# Local overrides
+.env
