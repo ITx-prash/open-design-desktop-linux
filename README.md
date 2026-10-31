@@ -78,6 +78,22 @@ To install with a specific browser or switch to another supported browser later:
 
 Run `./install.sh --help` for all options.
 
+#### Nix / NixOS
+
+A `flake.nix` is provided for Nix and NixOS users (community-maintained).
+
+Enter the dev environment:
+```bash
+nix develop
+```
+
+Run the installer:
+```bash
+./install.sh
+```
+
+Ensure a Chromium-based browser (Chrome, Chromium, Brave, Edge) is installed on your system. You can also build the package directly with `nix build`.
+
 ### Usage
 
 Launch **Open Design** from your application launcher, dock, or terminal (`open-design`). Right-click the dock icon (or use CLI flags) for quick actions:
