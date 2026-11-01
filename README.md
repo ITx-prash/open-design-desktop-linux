@@ -80,19 +80,16 @@ Run `./install.sh --help` for all options.
 
 #### Nix / NixOS
 
-A `flake.nix` is provided for Nix and NixOS users (community-maintained).
+A community-maintained `flake.nix` is included for Nix and NixOS users. It is not tested by the author. Flakes must be enabled.
 
-Enter the dev environment:
+Enter the dev environment, then run the installer:
+
 ```bash
 nix develop
-```
-
-Run the installer:
-```bash
 ./install.sh
 ```
 
-Ensure a Chromium-based browser (Chrome, Chromium, Brave, Edge) is installed on your system. You can also build the package directly with `nix build`.
+Install a supported Chromium-based browser separately (see [Requirements](#requirements)). `nix build` packages only the launcher and updater; Open Design itself is still cloned to `~/open-design` and built by `./install.sh`.
 
 ### Usage
 
